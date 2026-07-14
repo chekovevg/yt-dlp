@@ -73,7 +73,7 @@ The module regression suite will cover:
 - VTT/SRT cue text beginning exactly with `WEBVTT`, `Kind:`, or `Language:`;
 - end-to-end saving with a fake `yt-dlp` executable;
 - atomic two-process `-2`/`-3` output claims across transcript, review, and subtitle artifacts;
-- cancellation after staging and interruption after the first multi-artifact publish, including identity-safe rollback and workspace cleanup;
+- deterministic hard cancellation immediately after the first multi-artifact publish, including durable-manifest assertions, identity-safe rollback, same-path substitution preservation, committed-set retention, and complete process/workspace cleanup;
 - exact public result shapes, callback-output suppression, bounded diagnostics, and temporary workspace cleanup;
 - restoration of whitespace cleanup immediately inside brackets.
 

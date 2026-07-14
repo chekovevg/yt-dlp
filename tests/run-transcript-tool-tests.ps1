@@ -520,10 +520,11 @@ $tests = @(
                 $protectedPath = Join-Path $dir "Protected.txt"
                 $protectedBytes = [byte[]]@(121, 122, 123, 124)
                 [System.IO.File]::WriteAllBytes($protectedPath, $protectedBytes)
+                $replacementBytes = [byte[]]@(41, 42, 43, 44, 45)
                 $operationId = [Guid]::NewGuid().ToString("N")
                 $module = Get-Module transcript-tool
                 & $module {
-                    param($outputDir, $operation)
+                    param($outputDir, $operation, $replacement)
                     $reservation = New-TranscriptOutputReservation `
                         -OutputDir $outputDir `
                         -Stem "Interrupted" `
@@ -533,12 +534,19 @@ $tests = @(
                     try {
                         Write-TranscriptReservationText -Reservation $reservation -Suffix ".txt" -Text "complete text"
                         Write-TranscriptReservationText -Reservation $reservation -Suffix ".vtt" -Text "complete subtitle"
+                        $interruptAfterSubstitution = {
+                            param($publishedCount, $entry)
+                            if ($publishedCount -eq 1) {
+                                $originalPath = "$($entry.TargetPath).original"
+                                [System.IO.File]::Move([string]$entry.TargetPath, $originalPath)
+                                [System.IO.File]::WriteAllBytes([string]$entry.TargetPath, $replacement)
+                                [System.IO.File]::Delete($originalPath)
+                                throw "injected publish interruption"
+                            }
+                        }.GetNewClosure()
                         Publish-TranscriptOutputReservation `
                             -Reservation $reservation `
-                            -OnArtifactPublished {
-                                param($publishedCount, $entry)
-                                if ($publishedCount -eq 1) { throw "injected publish interruption" }
-                            }
+                            -OnArtifactPublished $interruptAfterSubstitution
                     }
                     catch { $publishError = $_ }
                     finally {
@@ -551,10 +559,11 @@ $tests = @(
                     if (-not $publishError -or $publishError.Exception.Message -notmatch "injected publish interruption") {
                         throw "Interrupted publish did not exercise the expected failure."
                     }
-                } $dir $operationId
+                } $dir $operationId $replacementBytes
 
                 Assert-BytesEqual -Expected $protectedBytes -Actual ([System.IO.File]::ReadAllBytes($protectedPath)) -Message "Interrupted publish changed an unrelated file."
-                Assert-True (-not (Test-Path -LiteralPath (Join-Path $dir "Interrupted.txt"))) "Interrupted publish left its first final artifact."
+                Assert-True (Test-Path -LiteralPath (Join-Path $dir "Interrupted.txt")) "Interrupted publish deleted the same-path replacement."
+                Assert-BytesEqual -Expected $replacementBytes -Actual ([System.IO.File]::ReadAllBytes((Join-Path $dir "Interrupted.txt"))) -Message "Interrupted publish changed the same-path replacement."
                 Assert-True (-not (Test-Path -LiteralPath (Join-Path $dir "Interrupted.vtt"))) "Interrupted publish left its second final artifact."
                 $leaks = @(Get-ChildItem -LiteralPath $dir -Force | Where-Object Name -like ".youtube-transcript-*")
                 Assert-True ($leaks.Count -eq 0) "Interrupted publish left staging/lock artifacts: $($leaks.Name -join ', ')"

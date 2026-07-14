@@ -296,7 +296,7 @@ git commit -m "fix: isolate command-line subtitle downloads"
 
 - [ ] **Step 1: Add a GUI launch smoke test**
 
-Create `tests/run-gui-smoke-tests.ps1`. Launch `powershell.exe -NoProfile -ExecutionPolicy Bypass -File transcript-tool-gui.ps1` with `Start-Process -WindowStyle Hidden -PassThru`, poll for up to five seconds until `MainWindowTitle` equals `YouTube Transcript Tool`, assert `Responding`, then stop only that exact process id in `finally`.
+Create `tests/run-gui-smoke-tests.ps1`. Repeat the production launcher semantics by passing `-WindowStyle Hidden` to `powershell.exe` before `-File transcript-tool-gui.ps1` (do not use the `Start-Process -WindowStyle Hidden` property, which also hides the WinForms window). Enumerate visible top-level windows for the exact child PID for up to ten seconds, require the title `YouTube Transcript Tool`, assert `Responding`, then stop only that exact process id in `finally`.
 
 - [ ] **Step 2: Run the smoke test before editing**
 

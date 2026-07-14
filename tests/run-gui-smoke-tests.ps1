@@ -22,6 +22,9 @@ public static class GuiSmokeWindowSearch
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetWindowText(IntPtr windowHandle, StringBuilder text, int count);
 
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr windowHandle);
+
     public static bool HasTopLevelWindow(uint processId, string title)
     {
         bool found = false;
@@ -31,7 +34,7 @@ public static class GuiSmokeWindowSearch
             uint windowProcessId;
             GetWindowThreadProcessId(windowHandle, out windowProcessId);
 
-            if (windowProcessId == processId)
+            if (windowProcessId == processId && IsWindowVisible(windowHandle))
             {
                 StringBuilder windowTitle = new StringBuilder(512);
                 GetWindowText(windowHandle, windowTitle, windowTitle.Capacity);
@@ -58,14 +61,15 @@ try {
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
+            "-WindowStyle",
+            "Hidden",
             "-File",
             ('"{0}"' -f $guiPath)
         ) `
         -WorkingDirectory $root `
-        -WindowStyle Hidden `
         -PassThru
 
-    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
     $windowFound = $false
 
     while ([DateTime]::UtcNow -lt $deadline) {
@@ -86,7 +90,7 @@ try {
     }
 
     if (-not $windowFound) {
-        throw "GUI main window did not appear within five seconds."
+        throw "Visible GUI main window did not appear within ten seconds."
     }
 
     $process.Refresh()

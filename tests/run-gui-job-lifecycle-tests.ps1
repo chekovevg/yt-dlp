@@ -274,23 +274,27 @@ function Start-LifecycleFixtureJob {
     }
 }
 
-function Start-CrashSafeSaveFixtureJob {
+function Start-CrashSafePublicationFixtureJob {
     param(
         [string]$ModulePath,
         [string]$NativeExe,
-        [string]$SourcePath,
         [string]$OutputDir,
         [string]$OperationId,
         [string]$WorkerIdentityPath,
-        [string]$StartGateName
+        [string]$StartGateName,
+        [string]$PublicationGateName,
+        [string]$HoldGateName,
+        [bool]$CommitBeforePause
     )
 
     Start-Job -ArgumentList @(
-        $ModulePath, $NativeExe, $SourcePath, $OutputDir, $OperationId,
-        $WorkerIdentityPath, $StartGateName
+        $ModulePath, $NativeExe, $OutputDir, $OperationId,
+        $WorkerIdentityPath, $StartGateName, $PublicationGateName,
+        $HoldGateName, $CommitBeforePause
     ) -ScriptBlock {
-        param($modulePath, $nativeExe, $sourcePath, $outputDir, $operationId,
-            $workerIdentityPath, $startGateName)
+        param($modulePath, $nativeExe, $outputDir, $operationId,
+            $workerIdentityPath, $startGateName, $publicationGateName,
+            $holdGateName, $commitBeforePause)
         $ErrorActionPreference = "Stop"
         $worker = [System.Diagnostics.Process]::GetCurrentProcess()
         $identity = [pscustomobject]@{
@@ -308,6 +312,8 @@ function Start-CrashSafeSaveFixtureJob {
         Import-Module $modulePath -Force
         $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("youtube-transcript-tool-" + $operationId)
         New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+        $publicationGate = [System.Threading.EventWaitHandle]::OpenExisting($publicationGateName)
+        $holdGate = [System.Threading.EventWaitHandle]::OpenExisting($holdGateName)
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $nativeExe
         $psi.UseShellExecute = $false
@@ -325,12 +331,53 @@ function Start-CrashSafeSaveFixtureJob {
                 UseShellExecute = $psi.UseShellExecute
             }
         }
-        Save-TranscriptFromSubtitleFile `
-            -Path $sourcePath `
-            -OutputDir $outputDir `
-            -CleanTranscript $true `
-            -OperationId $operationId | Out-Null
-        $native.WaitForExit()
+        try {
+            $module = Get-Module transcript-tool
+            & $module {
+                param($destination, $operation, $publishedGate, $blockedGate, $pauseAfterCommit)
+
+                $reservation = New-TranscriptOutputReservation `
+                    -OutputDir $destination `
+                    -Stem "CrashSafe" `
+                    -ArtifactSuffixes @(".txt", ".vtt") `
+                    -OperationId $operation
+                try {
+                    Write-TranscriptReservationText -Reservation $reservation -Suffix ".txt" -Text "first artifact"
+                    Write-TranscriptReservationText -Reservation $reservation -Suffix ".vtt" -Text "second artifact"
+
+                    if ($pauseAfterCommit) {
+                        Publish-TranscriptOutputReservation -Reservation $reservation
+                        [void]$publishedGate.Set()
+                        [void]$blockedGate.WaitOne()
+                    }
+                    else {
+                        $pauseAfterFirstMove = {
+                            param($publishedCount, $entry)
+                            if ($publishedCount -eq 1) {
+                                [void]$publishedGate.Set()
+                                [void]$blockedGate.WaitOne()
+                            }
+                        }.GetNewClosure()
+                        Publish-TranscriptOutputReservation `
+                            -Reservation $reservation `
+                            -OnArtifactPublished $pauseAfterFirstMove
+                    }
+                }
+                finally {
+                    Close-TranscriptOutputReservation -Reservation $reservation -DeleteFiles $true
+                    $root = Get-TranscriptOperationStagingRoot -OutputDir $destination -OperationId $operation
+                    if (Test-Path -LiteralPath $root) {
+                        Remove-TranscriptOperationStagingRoot -StagingRoot $root
+                    }
+                }
+            } $outputDir $operationId $publicationGate $holdGate $commitBeforePause
+            $native.WaitForExit()
+        }
+        finally {
+            $publicationGate.Dispose()
+            $holdGate.Dispose()
+            $native.Dispose()
+        }
     }
 }
 
@@ -487,6 +534,152 @@ public class Program
 '@
 
 Add-Type -TypeDefinition $source -OutputAssembly $nativeExe -OutputType ConsoleApplication
+
+function Invoke-CrashSafePublicationLifecycleCase {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("PartialCleanup", "SamePathSubstitution", "CommittedRetention")]
+        [string]$Case
+    )
+
+    $job = $null
+    $processGroup = $null
+    $workerHandle = $null
+    $nativeHandle = $null
+    $operationId = [Guid]::NewGuid().ToString("N")
+    $outputDir = Join-Path $tempRoot ("publication-output-" + $operationId)
+    $identityPath = Join-Path $tempRoot ("publication-worker-" + $operationId + ".json")
+    $stagingRoot = Join-Path $outputDir (".youtube-transcript-operation-" + $operationId)
+    $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("youtube-transcript-tool-" + $operationId)
+    $firstTarget = Join-Path $outputDir "CrashSafe.txt"
+    $secondTarget = Join-Path $outputDir "CrashSafe.vtt"
+    $lockPath = Join-Path $outputDir ".youtube-transcript-lock-CrashSafe.tmp"
+    $replacementPath = Join-Path $tempRoot ("replacement-" + $operationId + ".tmp")
+    $backupPath = Join-Path $tempRoot ("original-" + $operationId + ".bak")
+    $replacementBytes = [byte[]]@(90, 91, 92, 93, 94, 95)
+    $gatePrefix = "Local\TranscriptPublication-" + $operationId
+    $startGate = New-StartGate -Name ($gatePrefix + "-start")
+    $publicationGate = New-StartGate -Name ($gatePrefix + "-published")
+    $holdGate = New-StartGate -Name ($gatePrefix + "-hold")
+    $commitBeforePause = $Case -eq "CommittedRetention"
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+
+    try {
+        $job = Start-CrashSafePublicationFixtureJob `
+            -ModulePath (Join-Path $root "transcript-tool.psm1") `
+            -NativeExe $nativeExe `
+            -OutputDir $outputDir `
+            -OperationId $operationId `
+            -WorkerIdentityPath $identityPath `
+            -StartGateName ($gatePrefix + "-start") `
+            -PublicationGateName ($gatePrefix + "-published") `
+            -HoldGateName ($gatePrefix + "-hold") `
+            -CommitBeforePause $commitBeforePause
+
+        $workerMessage = @(Receive-LifecycleMessages -Job $job -RequiredKinds @("Worker")) |
+            Where-Object Kind -eq "Worker" | Select-Object -First 1
+        Assert-True ([bool]$workerMessage) "$Case worker identity was not received."
+        $workerIdentity = $workerMessage.Value
+        $workerHandle = New-LifecycleTestProcessHandle -Identity $workerIdentity
+        $processGroup = New-TranscriptProcessGroup -WorkerIdentity $workerIdentity
+        [void]$startGate.Set()
+        $startGate.Dispose(); $startGate = $null
+
+        $nativeMessage = @(Receive-LifecycleMessages -Job $job -RequiredKinds @("Native")) |
+            Where-Object Kind -eq "Native" | Select-Object -First 1
+        Assert-True ([bool]$nativeMessage) "$Case native identity was not received."
+        Assert-True ([bool]$nativeMessage.Value.CreateNoWindow) "$Case native fixture was not hidden."
+        Assert-True (-not [bool]$nativeMessage.Value.UseShellExecute) "$Case native fixture unexpectedly used the shell."
+        $nativeHandle = New-LifecycleTestProcessHandle -Identity $nativeMessage.Value
+
+        Assert-True ($publicationGate.WaitOne(10000)) "$Case worker never reached its deterministic publication gate."
+        $publications = @(Get-ChildItem -LiteralPath $stagingRoot -Directory -Filter "publication-*" -ErrorAction Stop)
+        Assert-True ($publications.Count -eq 1) "$Case expected one durable publication workspace."
+        $publicationDirectory = $publications[0].FullName
+        $manifestPath = Join-Path $publicationDirectory "manifest.json"
+        $commitPath = Join-Path $publicationDirectory "commit.marker"
+        Assert-True (Test-Path -LiteralPath $manifestPath) "$Case publication gate preceded its durable manifest."
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+        Assert-True (@($manifest.Entries).Count -eq 2) "$Case manifest did not describe both artifacts."
+        Assert-True (Test-Path -LiteralPath $lockPath) "$Case publication lock was not held at the gate."
+
+        if ($commitBeforePause) {
+            Assert-True (Test-Path -LiteralPath $commitPath) "Committed retention gate preceded commit.marker."
+            Assert-True (Test-Path -LiteralPath $firstTarget) "Committed retention lost its first artifact before cancellation."
+            Assert-True (Test-Path -LiteralPath $secondTarget) "Committed retention lost its second artifact before cancellation."
+        }
+        else {
+            Assert-True (-not (Test-Path -LiteralPath $commitPath)) "$Case unexpectedly reached commit.marker."
+            Assert-True (Test-Path -LiteralPath $firstTarget) "$Case did not publish its first artifact before the gate."
+            Assert-True (-not (Test-Path -LiteralPath $secondTarget)) "$Case published its second artifact before the gate."
+        }
+
+        $ticket = Request-TranscriptBackgroundJobStop `
+            -Job $job -ProcessGroup $processGroup -WorkerIdentity $workerIdentity `
+            -WorkerIdentityPath $identityPath -OperationId $operationId `
+            -OutputDir $outputDir -TemporaryDirectory $temporaryDirectory `
+            -StagingRoot $stagingRoot -UiDeadlineMilliseconds 100
+
+        $processGroup.Terminate()
+        Assert-ProcessHandleExited -ProcessHandle $workerHandle -Description "$Case worker"
+        Assert-ProcessHandleExited -ProcessHandle $nativeHandle -Description "$Case native"
+
+        if ($Case -eq "SamePathSubstitution") {
+            [System.IO.File]::WriteAllBytes($replacementPath, $replacementBytes)
+            [System.IO.File]::Replace($replacementPath, $firstTarget, $backupPath, $true)
+            [System.IO.File]::Delete($backupPath)
+        }
+
+        Complete-TranscriptBackgroundJobCleanup -Ticket $ticket
+
+        Assert-ProcessHandleExited -ProcessHandle $workerHandle -Description "$Case worker after deferred cleanup"
+        Assert-ProcessHandleExited -ProcessHandle $nativeHandle -Description "$Case native after deferred cleanup"
+        Assert-True (-not (Get-Job -Id $job.Id -ErrorAction SilentlyContinue)) "$Case job remained after deferred cleanup."
+        Assert-True (-not (Test-Path -LiteralPath $stagingRoot)) "$Case staging root leaked."
+        Assert-True (-not (Test-Path -LiteralPath $manifestPath)) "$Case manifest leaked."
+        Assert-True (-not (Test-Path -LiteralPath $temporaryDirectory)) "$Case GUI temporary workspace leaked."
+        Assert-True (-not (Test-Path -LiteralPath $lockPath)) "$Case publication lock leaked."
+        $operationLeaks = @(Get-ChildItem -LiteralPath $outputDir -Force -ErrorAction SilentlyContinue |
+            Where-Object Name -like ".youtube-transcript-*")
+        Assert-True ($operationLeaks.Count -eq 0) "$Case left operation artifacts: $($operationLeaks.Name -join ', ')"
+
+        if ($Case -eq "PartialCleanup") {
+            Assert-True (-not (Test-Path -LiteralPath $firstTarget)) "Partial cleanup left its identity-matched first artifact."
+            Assert-True (-not (Test-Path -LiteralPath $secondTarget)) "Partial cleanup left its unpublished second artifact."
+        }
+        elseif ($Case -eq "SamePathSubstitution") {
+            Assert-True (Test-Path -LiteralPath $firstTarget) "Deferred cleanup deleted the same-path replacement."
+            Assert-True (-not (Test-Path -LiteralPath $secondTarget)) "Substitution case left its unpublished second artifact."
+            Assert-True `
+                ([System.Linq.Enumerable]::SequenceEqual(
+                    $replacementBytes,
+                    [System.IO.File]::ReadAllBytes($firstTarget))) `
+                "Deferred cleanup changed the same-path replacement bytes."
+        }
+        else {
+            Assert-True (Test-Path -LiteralPath $firstTarget) "Deferred cleanup deleted a committed first artifact."
+            Assert-True (Test-Path -LiteralPath $secondTarget) "Deferred cleanup deleted a committed second artifact."
+            Assert-True ((Get-Content -LiteralPath $firstTarget -Raw -Encoding utf8) -eq "first artifact") "Committed first artifact bytes changed."
+            Assert-True ((Get-Content -LiteralPath $secondTarget -Raw -Encoding utf8) -eq "second artifact") "Committed second artifact bytes changed."
+        }
+
+        $job = $null
+        $processGroup = $null
+        Write-Host "PASS crash-safe publication - $Case"
+    }
+    finally {
+        if ($startGate) { $startGate.Dispose() }
+        if ($publicationGate) { $publicationGate.Dispose() }
+        if ($holdGate) { $holdGate.Dispose() }
+        Stop-LifecycleFixture -Job $job -ProcessGroup $processGroup `
+            -WorkerHandle $workerHandle -NativeHandle $nativeHandle
+        Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outputDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $identityPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $replacementPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+    }
+}
 
 $tests = @(
     @{
@@ -645,81 +838,16 @@ $tests = @(
         }
     },
     @{
-        Name = "Cancellation after staging removes operation outputs and workspaces"
-        Run = {
-            $job = $null
-            $processGroup = $null
-            $workerHandle = $null
-            $nativeHandle = $null
-            $operationId = [Guid]::NewGuid().ToString("N")
-            $outputDir = Join-Path $tempRoot ("cancel-output-" + $operationId)
-            $sourcePath = Join-Path $tempRoot ("cancel-source-" + $operationId + ".vtt")
-            $identityPath = Join-Path $tempRoot ("cancel-worker-" + $operationId + ".json")
-            $stagingRoot = Join-Path $outputDir (".youtube-transcript-operation-" + $operationId)
-            $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("youtube-transcript-tool-" + $operationId)
-            $gateName = "Local\TranscriptCrashSafe-" + $operationId
-            $startGate = New-StartGate -Name $gateName
-            New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
-            $builder = New-Object System.Text.StringBuilder
-            [void]$builder.Append("WEBVTT`r`n`r`n00:00:00.000 --> 01:00:00.000`r`n")
-            for ($index = 0; $index -lt 120000; $index++) {
-                [void]$builder.Append("Crash-safe caption ").Append($index).Append(".`r`n")
-            }
-            [System.IO.File]::WriteAllText($sourcePath, $builder.ToString(), (New-Object System.Text.UTF8Encoding($false)))
-
-            try {
-                $job = Start-CrashSafeSaveFixtureJob `
-                    -ModulePath (Join-Path $root "transcript-tool.psm1") `
-                    -NativeExe $nativeExe `
-                    -SourcePath $sourcePath `
-                    -OutputDir $outputDir `
-                    -OperationId $operationId `
-                    -WorkerIdentityPath $identityPath `
-                    -StartGateName $gateName
-                $workerMessage = @(Receive-LifecycleMessages -Job $job -RequiredKinds @("Worker")) |
-                    Where-Object Kind -eq "Worker" | Select-Object -First 1
-                $workerIdentity = $workerMessage.Value
-                $workerHandle = New-LifecycleTestProcessHandle -Identity $workerIdentity
-                $processGroup = New-TranscriptProcessGroup -WorkerIdentity $workerIdentity
-                [void]$startGate.Set()
-                $startGate.Dispose(); $startGate = $null
-                $nativeMessage = @(Receive-LifecycleMessages -Job $job -RequiredKinds @("Native")) |
-                    Where-Object Kind -eq "Native" | Select-Object -First 1
-                Assert-True ([bool]$nativeMessage.Value.CreateNoWindow) "Cancellation native fixture was visible."
-                $nativeHandle = New-LifecycleTestProcessHandle -Identity $nativeMessage.Value
-
-                $deadline = [DateTime]::UtcNow.AddSeconds(10)
-                while (-not (Test-Path -LiteralPath $stagingRoot) -and [DateTime]::UtcNow -lt $deadline) {
-                    Start-Sleep -Milliseconds 10
-                }
-                Assert-True (Test-Path -LiteralPath $stagingRoot) "Operation never reached its staging point."
-                $ticket = Request-TranscriptBackgroundJobStop `
-                    -Job $job -ProcessGroup $processGroup -WorkerIdentity $workerIdentity `
-                    -WorkerIdentityPath $identityPath -OperationId $operationId `
-                    -OutputDir $outputDir -TemporaryDirectory $temporaryDirectory `
-                    -StagingRoot $stagingRoot -UiDeadlineMilliseconds 100
-                Complete-TranscriptBackgroundJobCleanup -Ticket $ticket
-
-                Assert-ProcessHandleExited -ProcessHandle $workerHandle -Description "Cancelled staging worker"
-                Assert-ProcessHandleExited -ProcessHandle $nativeHandle -Description "Cancelled staging native"
-                Assert-True (-not (Get-Job -Id $job.Id -ErrorAction SilentlyContinue)) "Cancelled staging job remained."
-                Assert-True (-not (Test-Path -LiteralPath $stagingRoot)) "Operation staging root leaked."
-                Assert-True (-not (Test-Path -LiteralPath $temporaryDirectory)) "GUI temporary workspace leaked."
-                $outputs = @(Get-ChildItem -LiteralPath $outputDir -File -ErrorAction SilentlyContinue)
-                Assert-True ($outputs.Count -eq 0) "Cancellation left final/lock outputs: $($outputs.Name -join ', ')"
-                $job = $null; $processGroup = $null
-                Write-Host "PASS cancellation staging cleanup"
-            }
-            finally {
-                if ($startGate) { $startGate.Dispose() }
-                Stop-LifecycleFixture -Job $job -ProcessGroup $processGroup `
-                    -WorkerHandle $workerHandle -NativeHandle $nativeHandle
-                Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue
-                Remove-Item -LiteralPath $outputDir -Recurse -Force -ErrorAction SilentlyContinue
-                Remove-Item -LiteralPath $sourcePath -Force -ErrorAction SilentlyContinue
-                Remove-Item -LiteralPath $identityPath -Force -ErrorAction SilentlyContinue
-            }
-        }
+        Name = "Hard kill after first atomic move removes identity-matched partial publication"
+        Run = { Invoke-CrashSafePublicationLifecycleCase -Case PartialCleanup }
+    },
+    @{
+        Name = "Deferred cleanup preserves same-path replacement after hard kill"
+        Run = { Invoke-CrashSafePublicationLifecycleCase -Case SamePathSubstitution }
+    },
+    @{
+        Name = "Deferred cleanup retains a complete committed publication"
+        Run = { Invoke-CrashSafePublicationLifecycleCase -Case CommittedRetention }
     },
     @{
         Name = "Close before first timer tick cannot start native work"
