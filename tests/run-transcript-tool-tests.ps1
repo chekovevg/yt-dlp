@@ -210,6 +210,89 @@ $tests = @(
         }
     },
     @{
+        Name = "VTT conversion skips structural blocks and cue ids without losing caption text"
+        Run = {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-structure-tests-" + [System.Guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+            try {
+                $vtt = Join-Path $dir "structured.vtt"
+                Set-Content -LiteralPath $vtt -Encoding utf8 -Value @(
+                    "WEBVTT",
+                    "Kind: captions",
+                    "Language: en",
+                    "",
+                    "NOTE internal note heading",
+                    "Internal note text must not become speech.",
+                    "A second note line must also be skipped.",
+                    "",
+                    "STYLE",
+                    "::cue { color: lime; }",
+                    "::cue(.important) { font-weight: bold; }",
+                    "",
+                    "REGION",
+                    "id:transcript-region",
+                    "width:40%",
+                    "",
+                    "intro-cue",
+                    "00:00:00.000 --> 00:00:01.000 align:start position:0%",
+                    "<c.green>Hello &amp; welcome</c>",
+                    "",
+                    "year-cue",
+                    "00:00:01.000 --> 00:00:02.000",
+                    "2026",
+                    "",
+                    "repeat-cue",
+                    "00:00:02.000 --> 00:00:03.000",
+                    "Repeated <i>caption</i>.",
+                    "",
+                    "repeat-cue-2",
+                    "00:00:03.000 --> 00:00:04.000",
+                    "Repeated caption."
+                )
+
+                $text = Convert-SubtitleFileToTranscriptText -Path $vtt -TranscriptMode:$false
+                Assert-True ($text -notmatch "Internal note text") "NOTE block contents leaked into transcript: $text"
+                Assert-True ($text -notmatch "color: lime") "STYLE block contents leaked into transcript: $text"
+                Assert-True ($text -notmatch "transcript-region") "REGION block contents leaked into transcript: $text"
+                Assert-True ($text -notmatch "(?:intro|year|repeat)-cue") "Cue identifiers leaked into transcript: $text"
+                Assert-True ($text -match "Hello & welcome") "HTML entities should be decoded: $text"
+                Assert-True ($text -match "(?:^|\s)2026(?:\s|$)") "Numeric caption text was lost: $text"
+                Assert-True (($text | Select-String -Pattern "Repeated caption\." -AllMatches).Matches.Count -eq 1) "Adjacent duplicate captions should be collapsed: $text"
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "Subtitle conversion rejects a file containing only structure"
+        Run = {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-empty-tests-" + [System.Guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+            try {
+                $srt = Join-Path $dir "empty.srt"
+                Set-Content -LiteralPath $srt -Encoding utf8 -Value @(
+                    "1",
+                    "00:00:00,000 --> 00:00:01,000",
+                    ""
+                )
+
+                try {
+                    Convert-SubtitleFileToTranscriptText -Path $srt | Out-Null
+                    throw "Expected empty-transcript error."
+                }
+                catch {
+                    Assert-True ($_.Exception.Message -eq "Subtitle file did not contain readable transcript text.") "Unexpected empty-transcript error: $($_.Exception.Message)"
+                }
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
         Name = "yt-dlp warning on stderr does not abort successful metadata"
         Run = {
             $info = Invoke-YtDlpJson -YtDlpPath $fakeYtDlpPath -Url "https://youtube.com/watch?v=working"

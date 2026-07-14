@@ -435,49 +435,31 @@ function New-TranscriptFileName {
     return "${datePart}_${titlePart}_${idPart}_${languagePart}.txt"
 }
 
-function Convert-SubtitleFileToTranscriptText {
+function Test-SubtitleTimestamp {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
+        [AllowEmptyString()]
+        [string]$Line
     )
 
-    if (-not (Test-Path -LiteralPath $Path)) {
-        throw "Subtitle file was not found: $Path"
-    }
+    return [bool]($Line -match '^\s*(?:\d{2,}:)?\d{2}:\d{2}[\.,]\d{3}\s+-->\s+(?:\d{2,}:)?\d{2}:\d{2}[\.,]\d{3}(?:\s+.*)?$')
+}
 
-    $prev = $null
-    $lines = Get-Content -LiteralPath $Path -Encoding utf8 |
-        Where-Object {
-            $_ -notmatch '^(WEBVTT|Kind:.*|Language:.*|NOTE.*|STYLE.*|\s*|\d+|\d{2}:\d{2}:\d{2}[\.,]\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}[\.,]\d{3}(\s+.*)?)$'
-        } |
-        ForEach-Object {
-            $line = $_ -replace '<[^>]+>', ''
-            $line = [System.Net.WebUtility]::HtmlDecode($line)
-            $line = $line -replace ([char]0x00A0), ' '
-            $line = $line -replace '\[.*?\]', ''
-            $line = $line.Trim()
+function Format-TranscriptParagraphs {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$Sentences
+    )
 
-            if ($line -and $line -ne $prev) {
-                $prev = $line
-                $line
-            }
-        }
-
-    $text = ($lines -join ' ')
-    $text = $text -replace '\s{2,}', ' '
-    $text = $text -replace '\s+([.,!?;:])', '$1'
-
-    $sentences = [regex]::Split($text.Trim(), '(?<=[.!?])\s+') | Where-Object { $_.Trim() }
-
-    if ($sentences.Count -eq 0) {
-        return $text.Trim()
+    if ($Sentences.Count -eq 0) {
+        return ""
     }
 
     $paragraphs = New-Object System.Collections.Generic.List[string]
     $current = ""
     $count = 0
 
-    foreach ($sentence in $sentences) {
+    foreach ($sentence in $Sentences) {
         $sentence = $sentence.Trim()
 
         if (-not $current) {
@@ -502,6 +484,93 @@ function Convert-SubtitleFileToTranscriptText {
     }
 
     return ($paragraphs -join "`r`n`r`n")
+}
+
+function Convert-SubtitleFileToTranscriptText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [switch]$TranscriptMode
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Subtitle file was not found: $Path"
+    }
+
+    $sourceLines = @(Get-Content -LiteralPath $Path -Encoding utf8)
+    $lines = New-Object System.Collections.Generic.List[string]
+    $prev = $null
+    $block = $null
+    $atCueBoundary = $true
+
+    for ($i = 0; $i -lt $sourceLines.Count; $i++) {
+        $rawLine = [string]$sourceLines[$i]
+
+        if ($block) {
+            if ([string]::IsNullOrWhiteSpace($rawLine)) {
+                $block = $null
+                $atCueBoundary = $true
+            }
+
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($rawLine)) {
+            $atCueBoundary = $true
+            continue
+        }
+
+        if ($rawLine -match '^\s*(NOTE|STYLE|REGION)(?:\s|$)') {
+            $block = $Matches[1]
+            continue
+        }
+
+        if ($rawLine -match '^\s*(?:WEBVTT(?:\s.*)?|Kind:.*|Language:.*)\s*$') {
+            continue
+        }
+
+        if ($atCueBoundary) {
+            $nextIndex = $i + 1
+            while ($nextIndex -lt $sourceLines.Count -and [string]::IsNullOrWhiteSpace([string]$sourceLines[$nextIndex])) {
+                $nextIndex++
+            }
+
+            if ($nextIndex -lt $sourceLines.Count -and (Test-SubtitleTimestamp -Line ([string]$sourceLines[$nextIndex]))) {
+                continue
+            }
+        }
+
+        if (Test-SubtitleTimestamp -Line $rawLine) {
+            $atCueBoundary = $false
+            continue
+        }
+
+        $line = $rawLine -replace '<[^>]+>', ''
+        $line = [System.Net.WebUtility]::HtmlDecode($line)
+        $line = $line -replace ([char]0x00A0), ' '
+        $line = $line -replace '\[.*?\]', ''
+        $line = $line.Trim()
+
+        if ($line -and $line -ne $prev) {
+            $prev = $line
+            $lines.Add($line)
+        }
+
+        $atCueBoundary = $false
+    }
+
+    $text = ($lines -join ' ')
+    $text = $text -replace '\s{2,}', ' '
+    $text = $text -replace '\s+([.,!?;:])', '$1'
+    $text = $text.Trim()
+
+    if (-not $text) {
+        throw "Subtitle file did not contain readable transcript text."
+    }
+
+    $sentences = @([regex]::Split($text, '(?<=[.!?])\s+') | Where-Object { $_.Trim() })
+    return Format-TranscriptParagraphs -Sentences $sentences
 }
 
 function Save-TranscriptFromYoutube {
