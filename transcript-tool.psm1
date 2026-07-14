@@ -247,7 +247,23 @@ function Get-SubtitleMapLanguages {
         return @()
     }
 
-    return @($Map.PSObject.Properties.Name | Sort-Object)
+    $languages = foreach ($property in $Map.PSObject.Properties) {
+        if ($property.Name -eq "live_chat") {
+            continue
+        }
+
+        $formats = @($property.Value)
+        if ($formats.Count -gt 0) {
+            $hasTranscriptFormat = @($formats | Where-Object { $_.ext -in @("vtt", "srt") }).Count -gt 0
+            if (-not $hasTranscriptFormat) {
+                continue
+            }
+        }
+
+        $property.Name
+    }
+
+    return @($languages | Sort-Object)
 }
 
 function Get-AvailableTranscriptLanguages {
@@ -288,8 +304,8 @@ function Get-LanguageCandidates {
 
 function Find-LanguageTag {
     param(
-        [Parameter(Mandatory = $true)]
-        [string[]]$AvailableTags,
+        [AllowEmptyCollection()]
+        [string[]]$AvailableTags = @(),
 
         [Parameter(Mandatory = $true)]
         [string]$Language
@@ -301,8 +317,11 @@ function Find-LanguageTag {
         }
     }
 
-    if ($AvailableTags -contains $Language) {
-        return $Language
+    $languagePattern = "^{0}(-|$)" -f [regex]::Escape($Language)
+    foreach ($tag in $AvailableTags) {
+        if ($tag -match $languagePattern) {
+            return $tag
+        }
     }
 
     return $null

@@ -54,12 +54,12 @@ function Assert-True {
 
 function New-FakeInfo {
     $subtitles = [pscustomobject]@{
-        en = @(@{})
+        en = @([pscustomobject]@{ ext = "vtt" })
     }
 
     $automaticCaptions = [pscustomobject]@{
-        ru = @(@{})
-        "en-GB" = @(@{})
+        ru = @([pscustomobject]@{ ext = "vtt" })
+        "en-GB" = @([pscustomobject]@{ ext = "vtt" })
     }
 
     [pscustomobject]@{
@@ -77,6 +77,66 @@ $tests = @(
             $choice = Resolve-TranscriptSubtitleChoice -Info (New-FakeInfo) -Preference "auto"
             Assert-True ($choice.Language -eq "ru") "Expected ru, got $($choice.Language)"
             Assert-True ($choice.Source -eq "auto") "Expected auto captions, got $($choice.Source)"
+        }
+    },
+    @{
+        Name = "Auto chooses Russian captions when only automatic captions exist"
+        Run = {
+            $autoOnly = [pscustomobject]@{
+                subtitles = $null
+                automatic_captions = [pscustomobject]@{
+                    ru = @([pscustomobject]@{ ext = "vtt" })
+                }
+            }
+
+            $choice = Resolve-TranscriptSubtitleChoice -Info $autoOnly -Preference "auto"
+            Assert-True ($choice.Tag -eq "ru") "Expected auto-only Russian captions."
+        }
+    },
+    @{
+        Name = "Auto chooses English captions when only manual captions exist"
+        Run = {
+            $manualOnly = [pscustomobject]@{
+                subtitles = [pscustomobject]@{
+                    en = @([pscustomobject]@{ ext = "vtt" })
+                }
+                automatic_captions = $null
+            }
+
+            $choice = Resolve-TranscriptSubtitleChoice -Info $manualOnly -Preference "auto"
+            Assert-True ($choice.Tag -eq "en") "Expected manual-only English captions."
+        }
+    },
+    @{
+        Name = "Explicit English preference accepts an Australian regional tag"
+        Run = {
+            $regionalEnglish = [pscustomobject]@{
+                subtitles = [pscustomobject]@{
+                    "en-AU" = @([pscustomobject]@{ ext = "vtt" })
+                }
+                automatic_captions = [pscustomobject]@{
+                    ja = @([pscustomobject]@{ ext = "vtt" })
+                }
+            }
+
+            $choice = Resolve-TranscriptSubtitleChoice -Info $regionalEnglish -Preference "en"
+            Assert-True ($choice.Tag -eq "en-AU") "Expected en-AU for an explicit English preference."
+        }
+    },
+    @{
+        Name = "Auto skips manual live chat in favor of Japanese captions"
+        Run = {
+            $liveChatAndCaptions = [pscustomobject]@{
+                subtitles = [pscustomobject]@{
+                    live_chat = @([pscustomobject]@{ ext = "json" })
+                }
+                automatic_captions = [pscustomobject]@{
+                    ja = @([pscustomobject]@{ ext = "vtt" })
+                }
+            }
+
+            $choice = Resolve-TranscriptSubtitleChoice -Info $liveChatAndCaptions -Preference "auto"
+            Assert-True ($choice.Tag -eq "ja") "Expected Japanese captions instead of live chat."
         }
     },
     @{
