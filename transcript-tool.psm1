@@ -521,7 +521,7 @@ function Convert-SubtitleFileToTranscriptText {
             continue
         }
 
-        if ($rawLine -match '^\s*(NOTE|STYLE|REGION)(?:\s|$)') {
+        if ($atCueBoundary -and $rawLine -match '^\s*(NOTE|STYLE|REGION)(?:\s|$)') {
             $block = $Matches[1]
             continue
         }

@@ -293,6 +293,43 @@ $tests = @(
         }
     },
     @{
+        Name = "VTT conversion preserves cue payloads beginning with structural block names"
+        Run = {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-block-name-tests-" + [System.Guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+            try {
+                $vtt = Join-Path $dir "block-name-speech.vtt"
+                Set-Content -LiteralPath $vtt -Encoding utf8 -Value @(
+                    "WEBVTT",
+                    "",
+                    "note-cue",
+                    "00:00:00.000 --> 00:00:01.000",
+                    "NOTE this carefully",
+                    "",
+                    "style-cue",
+                    "00:00:01.000 --> 00:00:02.000",
+                    "STYLE matters",
+                    "",
+                    "region-cue",
+                    "00:00:02.000 --> 00:00:03.000",
+                    "REGION names matter",
+                    "",
+                    "ordinary-cue",
+                    "00:00:03.000 --> 00:00:04.000",
+                    "Anchor text."
+                )
+
+                $text = Convert-SubtitleFileToTranscriptText -Path $vtt
+                $expected = "NOTE this carefully STYLE matters REGION names matter Anchor text."
+                Assert-True ($text -eq $expected) "Cue payloads beginning with structural names were lost. Expected '$expected', got '$text'."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
         Name = "yt-dlp warning on stderr does not abort successful metadata"
         Run = {
             $info = Invoke-YtDlpJson -YtDlpPath $fakeYtDlpPath -Url "https://youtube.com/watch?v=working"
