@@ -502,11 +502,24 @@ function Request-TranscriptBackgroundJobStop {
 }
 
 function Complete-TranscriptBackgroundJobCleanup {
-    param([Parameter(Mandatory = $true)][object]$Ticket)
+    param(
+        [Parameter(Mandatory = $true)][object]$Ticket,
+
+        [scriptblock]$TreeTerminator = {
+            param($WorkerIdentity)
+
+            [TranscriptProcessTools]::TerminateTreeIfIdentityMatches(
+                [int]$WorkerIdentity.Id,
+                [long]$WorkerIdentity.CreationFileTimeUtc
+            )
+        }
+    )
 
     $job = $Ticket.Job
     $group = $Ticket.ProcessGroup
     $identity = $Ticket.WorkerIdentity
+    $cleanupError = $null
+    $removeJobError = $null
 
     try {
         if (-not $Ticket.WasTerminal -and -not (Test-TranscriptJobTerminal -Job $job)) {
@@ -545,25 +558,54 @@ function Complete-TranscriptBackgroundJobCleanup {
             }
 
             if (-not $terminated -and $identity) {
-                [void][TranscriptProcessTools]::TerminateTreeIfIdentityMatches(
-                    [int]$identity.Id,
-                    [long]$identity.CreationFileTimeUtc
-                )
+                $null = & $TreeTerminator $identity
             }
         }
-
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
+    catch {
+        $cleanupError = $_
     }
     finally {
-        if ($group) {
-            try { $group.Dispose() } catch {}
+        try {
+            Remove-Job -Job $job -Force -ErrorAction Stop
         }
+        catch {
+            $removeJobError = $_
+        }
+        finally {
+            if ($group) {
+                try {
+                    $group.Dispose()
+                }
+                catch {
+                    if (-not $cleanupError) {
+                        $cleanupError = $_
+                    }
+                }
+            }
 
-        if ($Ticket.WorkerIdentityPath) {
-            Remove-Item `
-                -LiteralPath $Ticket.WorkerIdentityPath `
-                -Force `
-                -ErrorAction SilentlyContinue
+            if ($Ticket.WorkerIdentityPath -and
+                (Test-Path -LiteralPath $Ticket.WorkerIdentityPath)) {
+                try {
+                    Remove-Item `
+                        -LiteralPath $Ticket.WorkerIdentityPath `
+                        -Force `
+                        -ErrorAction Stop
+                }
+                catch {
+                    if (-not $cleanupError) {
+                        $cleanupError = $_
+                    }
+                }
+            }
         }
+    }
+
+    if ($cleanupError) {
+        throw $cleanupError
+    }
+
+    if ($removeJobError) {
+        throw $removeJobError
     }
 }
