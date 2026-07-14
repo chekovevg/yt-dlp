@@ -1,15 +1,16 @@
 # YouTube Transcript Tool
 
-Small Windows desktop utility for saving readable text transcripts from YouTube videos.
+Small Windows utility with desktop and command-line modes for saving readable text transcripts from YouTube videos.
 
-The tool uses the local `yt-dlp.exe` in this folder. It does not download video files and does not require a YouTube API key or login.
+The bundled `yt-dlp.exe` next to the scripts is used first. The desktop app can also fall back to `yt-dlp.exe` from `PATH`. The tool does not download video files and does not require a YouTube API key or login.
 
 ## What It Does
 
-- Opens as a small desktop window.
+- Provides a small desktop window and a script-friendly command-line mode.
 - Accepts a YouTube video link.
 - Saves a `.txt` transcript to a chosen local folder.
 - Remains usable while `yt-dlp` is running in the background.
+- Cancels the active background worker and its `yt-dlp` child process when the desktop window is closed.
 - Remembers the save folder, subtitle language, and "also save subtitles" checkbox between launches.
 - Can optionally save the original `.vtt` subtitle file next to the `.txt`.
 
@@ -17,12 +18,12 @@ The tool uses the local `yt-dlp.exe` in this folder. It does not download video 
 
 - Windows.
 - Windows PowerShell 5 or newer, included with Windows.
-- `yt-dlp.exe` next to the scripts in this folder, or installed in `PATH`.
+- The bundled `yt-dlp.exe` next to the scripts. The desktop app can alternatively use one installed in `PATH`.
 - Internet access.
 
 Python is not required.
 
-## Run
+## Run The Desktop App
 
 Double-click:
 
@@ -31,6 +32,39 @@ youtube-transcript-tool.cmd
 ```
 
 If Windows opens a console for a moment, that is normal; the desktop window should appear after it.
+
+## Run From The Command Line
+
+Pass a YouTube URL to the console launcher:
+
+```powershell
+.\download-subs.cmd "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+Examples:
+
+```powershell
+# Prefer English and choose an output folder.
+.\download-subs.cmd "https://www.youtube.com/watch?v=VIDEO_ID" -Prefer en -OutputDir "D:\Transcripts"
+
+# Show the video's available subtitle tracks without downloading them.
+.\download-subs.cmd -List "https://www.youtube.com/watch?v=VIDEO_ID"
+
+# Request explicit yt-dlp language expressions.
+.\download-subs.cmd "https://www.youtube.com/watch?v=VIDEO_ID" -Langs "ru.*,en.*"
+```
+
+The default command downloads subtitles into an isolated temporary folder, converts the selected current-run subtitle to text, and then removes only that temporary folder.
+
+- `-KeepSubs` saves the transcript and also copies the selected subtitle from the current run into the output folder.
+- `-NoClean` skips text conversion and copies all subtitle files produced by the current run into the output folder. It does not expose or reuse the temporary working folder.
+- `-Srt` requests SRT instead of VTT.
+- `-CleanTranscript` enables the optional transcript-specific text normalization.
+- `-CleanOnly` converts an existing VTT or SRT file beside the scripts without deleting that source file.
+
+## File Safety
+
+The tool does not delete or overwrite existing `.txt`, `.vtt`, or `.srt` files. If a planned output name already exists, the complete set of new files uses the next available shared suffix such as `-2` or `-3`. This keeps a transcript, its review file, and its saved subtitle coordinated while preserving the existing files byte-for-byte.
 
 ## Create A Desktop Shortcut
 
@@ -115,6 +149,15 @@ YouTube subtitles are often imperfect. Auto-generated captions can contain recog
 
 For publishing-quality text, use original-language subtitles as a draft and edit the result manually.
 
+## Update yt-dlp
+
+Updates are manual; the app does not update in the background and does not provide an update button. From PowerShell in the tool folder, install the current stable release and then check the bundled version:
+
+```powershell
+.\yt-dlp.exe -U
+.\yt-dlp.exe --version
+```
+
 ## Smoke Test Checklist
 
 1. Run `youtube-transcript-tool.cmd`.
@@ -130,26 +173,13 @@ For publishing-quality text, use original-language subtitles as a draft and edit
 
 ## Developer Checks
 
-Run the desktop launch/responding smoke test:
+Run every regression suite from the tool folder:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-gui-smoke-tests.ps1
-```
-
-Run the desktop background-job lifecycle check:
-
-```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-gui-job-lifecycle-tests.ps1
-```
-
-Run backend smoke tests:
-
-```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-transcript-tool-tests.ps1
-```
-
-Existing subtitle script regression tests:
-
-```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-download-subs-tests.ps1
 ```
+
+The checks cover desktop launch/responding behavior, bounded background-job shutdown, the shared transcript core, the command-line interface, file-collision safety, and temporary-directory cleanup.
