@@ -4,6 +4,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $root = Split-Path -Parent $PSCommandPath
+. (Join-Path $root "transcript-job-lifecycle.ps1")
 Import-Module (Join-Path $root "transcript-tool.psm1") -Force
 
 function New-Utf8String {
@@ -45,7 +46,6 @@ function Set-UiStatus {
     )
 
     $Label.Text = $Text
-    [System.Windows.Forms.Application]::DoEvents()
 }
 
 function Show-UserError {
@@ -163,6 +163,9 @@ $lastOutputDir = $folderBox.Text
 $activeJob = $null
 $activeResult = $null
 $activeError = $null
+$activeWorkerProcessId = 0
+$activeStartGate = $null
+$activeWorkerPidPath = $null
 
 $jobTimer = New-Object System.Windows.Forms.Timer
 $jobTimer.Interval = 200
@@ -194,6 +197,29 @@ $jobTimer.Add_Tick({
 
     foreach ($message in $messages) {
         switch ([string]$message.Kind) {
+            "Worker" {
+                $script:activeWorkerProcessId = [int]$message.Value
+
+                if ($script:activeStartGate) {
+                    $startGate = $script:activeStartGate
+                    $script:activeStartGate = $null
+
+                    try {
+                        [void]$startGate.Set()
+                    }
+                    finally {
+                        $startGate.Dispose()
+                    }
+                }
+
+                if ($script:activeWorkerPidPath) {
+                    Remove-Item `
+                        -LiteralPath $script:activeWorkerPidPath `
+                        -Force `
+                        -ErrorAction SilentlyContinue
+                    $script:activeWorkerPidPath = $null
+                }
+            }
             "Status" {
                 $status = [string]$message.Value
                 switch ($status) {
@@ -230,6 +256,20 @@ $jobTimer.Add_Tick({
     $script:activeJob = $null
     $script:activeResult = $null
     $script:activeError = $null
+    $script:activeWorkerProcessId = 0
+
+    if ($script:activeStartGate) {
+        $script:activeStartGate.Dispose()
+        $script:activeStartGate = $null
+    }
+
+    if ($script:activeWorkerPidPath) {
+        Remove-Item `
+            -LiteralPath $script:activeWorkerPidPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+        $script:activeWorkerPidPath = $null
+    }
 
     $saveButton.Enabled = $true
     $browseButton.Enabled = $true
@@ -260,6 +300,60 @@ $jobTimer.Add_Tick({
 
     Show-UserError $errorMessage
 })
+
+function Stop-ActiveTranscriptJob {
+    $job = $script:activeJob
+    if (-not $job) {
+        return
+    }
+
+    if ($script:activeStartGate) {
+        $script:activeStartGate.Dispose()
+        $script:activeStartGate = $null
+    }
+
+    if (-not $script:activeWorkerProcessId -and
+        $script:activeWorkerPidPath -and
+        (Test-Path -LiteralPath $script:activeWorkerPidPath)) {
+        $workerPidText = Get-Content `
+            -LiteralPath $script:activeWorkerPidPath `
+            -Raw `
+            -ErrorAction SilentlyContinue
+        $parsedWorkerProcessId = 0
+
+        if ([int]::TryParse($workerPidText, [ref]$parsedWorkerProcessId)) {
+            $script:activeWorkerProcessId = $parsedWorkerProcessId
+        }
+    }
+
+    if (-not $script:activeWorkerProcessId) {
+        $pendingMessages = @(Receive-Job -Job $job -ErrorAction SilentlyContinue)
+        $workerMessage = $pendingMessages |
+            Where-Object Kind -eq "Worker" |
+            Select-Object -First 1
+
+        if ($workerMessage) {
+            $script:activeWorkerProcessId = [int]$workerMessage.Value
+        }
+    }
+
+    if ($script:activeWorkerPidPath) {
+        Remove-Item `
+            -LiteralPath $script:activeWorkerPidPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+        $script:activeWorkerPidPath = $null
+    }
+
+    Stop-TranscriptBackgroundJob `
+        -Job $job `
+        -WorkerProcessId $script:activeWorkerProcessId
+
+    $script:activeJob = $null
+    $script:activeResult = $null
+    $script:activeError = $null
+    $script:activeWorkerProcessId = 0
+}
 
 $browseButton.Add_Click({
     $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -306,12 +400,53 @@ $saveButton.Add_Click({
         $modulePath = Join-Path $root "transcript-tool.psm1"
         $script:activeResult = $null
         $script:activeError = $null
+        $script:activeWorkerProcessId = 0
+        $startGateName = "Local\YouTubeTranscriptTool-" + [Guid]::NewGuid().ToString("N")
+        $script:activeWorkerPidPath = Join-Path `
+            ([System.IO.Path]::GetTempPath()) `
+            ("youtube-transcript-tool-worker-" + [Guid]::NewGuid().ToString("N") + ".pid")
+        $script:activeStartGate = New-Object System.Threading.EventWaitHandle -ArgumentList @(
+            $false,
+            [System.Threading.EventResetMode]::ManualReset,
+            $startGateName
+        )
         $script:activeJob = Start-Job `
-            -ArgumentList @($modulePath, $url, $outputDir, $language, $keepSubtitles) `
+            -ArgumentList @(
+                $modulePath,
+                $url,
+                $outputDir,
+                $language,
+                $keepSubtitles,
+                $startGateName,
+                $script:activeWorkerPidPath
+            ) `
             -ScriptBlock {
-                param($modulePath, $url, $outputDir, $language, $keepSubtitles)
+                param(
+                    $modulePath,
+                    $url,
+                    $outputDir,
+                    $language,
+                    $keepSubtitles,
+                    $startGateName,
+                    $workerPidPath
+                )
 
                 $ErrorActionPreference = "Stop"
+                [System.IO.File]::WriteAllText($workerPidPath, [string]$PID)
+                $startGate = [System.Threading.EventWaitHandle]::OpenExisting($startGateName)
+
+                try {
+                    [pscustomobject]@{
+                        Kind = "Worker"
+                        Value = $PID
+                    }
+
+                    [void]$startGate.WaitOne()
+                }
+                finally {
+                    $startGate.Dispose()
+                }
+
                 Import-Module $modulePath -Force
 
                 Save-TranscriptFromYoutube `
@@ -345,13 +480,24 @@ $saveButton.Add_Click({
         $jobTimer.Stop()
 
         if ($script:activeJob) {
-            Stop-Job -Job $script:activeJob -ErrorAction SilentlyContinue
-            Remove-Job -Job $script:activeJob -Force -ErrorAction SilentlyContinue
-            $script:activeJob = $null
+            Stop-ActiveTranscriptJob
+        }
+        elseif ($script:activeStartGate) {
+            $script:activeStartGate.Dispose()
+            $script:activeStartGate = $null
+        }
+
+        if ($script:activeWorkerPidPath) {
+            Remove-Item `
+                -LiteralPath $script:activeWorkerPidPath `
+                -Force `
+                -ErrorAction SilentlyContinue
+            $script:activeWorkerPidPath = $null
         }
 
         $script:activeResult = $null
         $script:activeError = $null
+        $script:activeWorkerProcessId = 0
         Set-UiStatus -Label $statusLabel -Text $uiText.Error
         Show-UserError $_.Exception.Message
         $saveButton.Enabled = $true
@@ -363,13 +509,24 @@ $form.Add_FormClosing({
     $jobTimer.Stop()
 
     if ($script:activeJob) {
-        Stop-Job -Job $script:activeJob -ErrorAction SilentlyContinue
-        Remove-Job -Job $script:activeJob -Force -ErrorAction SilentlyContinue
-        $script:activeJob = $null
+        Stop-ActiveTranscriptJob
+    }
+    elseif ($script:activeStartGate) {
+        $script:activeStartGate.Dispose()
+        $script:activeStartGate = $null
+    }
+
+    if ($script:activeWorkerPidPath) {
+        Remove-Item `
+            -LiteralPath $script:activeWorkerPidPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+        $script:activeWorkerPidPath = $null
     }
 
     $script:activeResult = $null
     $script:activeError = $null
+    $script:activeWorkerProcessId = 0
 })
 
 [System.Windows.Forms.Application]::EnableVisualStyles()

@@ -136,6 +136,12 @@ Run the desktop launch/responding smoke test:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-gui-smoke-tests.ps1
 ```
 
+Run the desktop background-job lifecycle check:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-gui-job-lifecycle-tests.ps1
+```
+
 Run backend smoke tests:
 
 ```powershell
