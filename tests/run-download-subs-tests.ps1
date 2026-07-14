@@ -1,3 +1,7 @@
+param(
+    [string]$Filter = ""
+)
+
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -48,6 +52,11 @@ public class Program {
         File.WriteAllText(Path.Combine(directory, name), content, new UTF8Encoding(false));
     }
 
+    private static string GetArgumentValue(string[] args, string name) {
+        var index = Array.IndexOf(args, name);
+        return index >= 0 && index + 1 < args.Length ? args[index + 1] : "";
+    }
+
     public static int Main(string[] args) {
         if (args.Contains("--print")) {
             var printUrl = args.Length == 0 ? "" : args[args.Length - 1];
@@ -71,6 +80,35 @@ public class Program {
         }
 
         var url = args.Length == 0 ? "" : args[args.Length - 1];
+
+        if (url.Contains("all-attempts-fail")) {
+            Console.Error.WriteLine("ERROR: synthetic all-attempt diagnostic");
+            return 7;
+        }
+
+        if (url.Contains("downloaded-despite-error")) {
+            WriteSubtitle(
+                args,
+                "Partial [partial].en.vtt",
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPartial subtitle\n");
+            Console.Error.WriteLine("ERROR: synthetic partial-download diagnostic");
+            return 8;
+        }
+
+        if (url.Contains("option-run")) {
+            var requestedLangs = GetArgumentValue(args, "--sub-langs");
+            var isSrt = args.Contains("--convert-subs") && GetArgumentValue(args, "--convert-subs") == "srt";
+            if (requestedLangs != "custom-lang" || !isSrt) {
+                Console.Error.WriteLine("ERROR: option-run requires custom-lang and SRT");
+                return 9;
+            }
+
+            WriteSubtitle(
+                args,
+                "Options [options].custom-lang.srt",
+                "1\n00:00:00,000 --> 00:00:01,000\nOption subtitle\n");
+            return 0;
+        }
 
         if (url.Contains("existing")) {
             return 0;
@@ -205,6 +243,24 @@ function Assert-True {
 
     if (-not $Condition) {
         throw $Message
+    }
+}
+
+function Assert-BytesEqual {
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Expected,
+
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Actual,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    Assert-True ($Expected.Length -eq $Actual.Length) "$Message Expected $($Expected.Length) bytes, got $($Actual.Length)."
+    for ($i = 0; $i -lt $Expected.Length; $i++) {
+        Assert-True ($Expected[$i] -eq $Actual[$i]) "$Message Byte $i changed from $($Expected[$i]) to $($Actual[$i])."
     }
 }
 
@@ -394,6 +450,119 @@ $tests = @(
         }
     },
     @{
+        Name = "NoClean honors Srt and Langs while preserving subtitle collisions"
+        Run = {
+            $dir = New-TestWorkspace
+            $outputDir = Join-Path $dir "custom-output"
+            New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+
+            try {
+                $oldBase = Join-Path $outputDir "Options [options].custom-lang.srt"
+                $oldSecond = Join-Path $outputDir "Options [options].custom-lang-2.srt"
+                $oldBaseBytes = [byte[]]@(41, 42, 43, 44)
+                $oldSecondBytes = [byte[]]@(51, 52, 53, 54)
+                [System.IO.File]::WriteAllBytes($oldBase, $oldBaseBytes)
+                [System.IO.File]::WriteAllBytes($oldSecond, $oldSecondBytes)
+
+                $result = Invoke-DownloadSubs `
+                    -Directory $dir `
+                    -Arguments @(
+                        "https://example.test/option-run",
+                        "-NoClean",
+                        "-Srt",
+                        "-Langs", "custom-lang",
+                        "-OutputDir", $outputDir
+                    )
+
+                Assert-True ($result.ExitCode -eq 0) "Expected NoClean success, got: $($result.Output)"
+                Assert-True ($result.Output -match "Trying subtitles: custom-lang") "Expected exact Langs override, got: $($result.Output)"
+                Assert-True ($result.Output -notmatch "Trying subtitles: (ru|en|de)") "Langs override unexpectedly fell back: $($result.Output)"
+                Assert-BytesEqual -Expected $oldBaseBytes -Actual ([System.IO.File]::ReadAllBytes($oldBase)) -Message "Existing base SRT changed."
+                Assert-BytesEqual -Expected $oldSecondBytes -Actual ([System.IO.File]::ReadAllBytes($oldSecond)) -Message "Existing -2 SRT changed."
+
+                $third = Join-Path $outputDir "Options [options].custom-lang-3.srt"
+                Assert-True (Test-Path -LiteralPath $third) "Expected collision-safe -3 SRT output."
+                Assert-True (-not (Test-Path -LiteralPath (Join-Path $outputDir "Options [options].custom-lang-3.txt"))) "NoClean unexpectedly created text."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "KeepSubs coordinates transcript and subtitle collision suffixes"
+        Run = {
+            $dir = New-TestWorkspace
+            $outputDir = Join-Path $dir "keep-output"
+            New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+
+            try {
+                $oldText = Join-Path $outputDir "Fresh [fresh].en.txt"
+                $oldSecondSubtitle = Join-Path $outputDir "Fresh [fresh].en-2.vtt"
+                $oldTextBytes = [byte[]]@(61, 62, 63, 64)
+                $oldSecondSubtitleBytes = [byte[]]@(71, 72, 73, 74)
+                [System.IO.File]::WriteAllBytes($oldText, $oldTextBytes)
+                [System.IO.File]::WriteAllBytes($oldSecondSubtitle, $oldSecondSubtitleBytes)
+
+                $result = Invoke-DownloadSubs `
+                    -Directory $dir `
+                    -Arguments @(
+                        "https://example.test/fresh",
+                        "-Prefer", "en",
+                        "-KeepSubs",
+                        "-OutputDir", $outputDir
+                    )
+
+                Assert-True ($result.ExitCode -eq 0) "Expected KeepSubs success, got: $($result.Output)"
+                Assert-BytesEqual -Expected $oldTextBytes -Actual ([System.IO.File]::ReadAllBytes($oldText)) -Message "Existing transcript changed. CLI output: $($result.Output)"
+                Assert-BytesEqual -Expected $oldSecondSubtitleBytes -Actual ([System.IO.File]::ReadAllBytes($oldSecondSubtitle)) -Message "Existing -2 subtitle changed."
+                Assert-True (Test-Path -LiteralPath (Join-Path $outputDir "Fresh [fresh].en-3.txt")) "Expected -3 transcript."
+                Assert-True (Test-Path -LiteralPath (Join-Path $outputDir "Fresh [fresh].en-3.vtt")) "Expected coordinated -3 subtitle."
+                Assert-True (-not (Test-Path -LiteralPath (Join-Path $outputDir "Fresh [fresh].en.vtt"))) "KeepSubs wrote an unsuffixed subtitle beside an existing transcript."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "All failed attempts print the last yt-dlp diagnostic"
+        Run = {
+            $dir = New-TestWorkspace
+            try {
+                $result = Invoke-DownloadSubs `
+                    -Directory $dir `
+                    -Arguments @("https://example.test/all-attempts-fail", "-Prefer", "en")
+
+                Assert-True ($result.ExitCode -eq 1) "Expected normal-mode no-subtitle exit 1, got $($result.ExitCode): $($result.Output)"
+                Assert-True ($result.Output -match "synthetic all-attempt diagnostic") "Expected preserved failure diagnostic, got: $($result.Output)"
+                Assert-True ($result.Output -match "No Russian, English, or German subtitles") "Expected existing no-subtitle guidance, got: $($result.Output)"
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "Downloaded-despite-error warning includes yt-dlp diagnostic"
+        Run = {
+            $dir = New-TestWorkspace
+            try {
+                $result = Invoke-DownloadSubs `
+                    -Directory $dir `
+                    -Arguments @("https://example.test/downloaded-despite-error", "-Prefer", "en")
+
+                Assert-True ($result.ExitCode -eq 0) "Expected downloaded subtitle to be converted, got: $($result.Output)"
+                Assert-True ($result.Output -match "yt-dlp reported an error") "Expected downloaded-despite-error warning, got: $($result.Output)"
+                Assert-True ($result.Output -match "synthetic partial-download diagnostic") "Expected warning diagnostic, got: $($result.Output)"
+                Assert-True (Test-Path -LiteralPath (Join-Path $dir "texts\Partial [partial].en.txt")) "Expected partial subtitle transcript."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
         Name = "Unknown video language tries exact Russian tags before English"
         Run = {
             $dir = New-TestWorkspace
@@ -448,11 +617,26 @@ $tests = @(
     }
 )
 
-$failed = 0
+$selectedTests = @(
+    if ($Filter) {
+        $tests | Where-Object { $_.Name -like "*$Filter*" }
+    }
+    else {
+        $tests
+    }
+)
 
-foreach ($test in $tests) {
+if ($selectedTests.Count -eq 0) {
+    throw "No tests matched filter '$Filter'."
+}
+
+$failed = 0
+$passed = 0
+
+foreach ($test in $selectedTests) {
     try {
         & $test.Run
+        $passed++
         Write-Host "PASS $($test.Name)"
     }
     catch {
@@ -465,3 +649,5 @@ foreach ($test in $tests) {
 if ($failed -gt 0) {
     throw "$failed test(s) failed."
 }
+
+Write-Host "$passed/$($selectedTests.Count) CLI tests passed."

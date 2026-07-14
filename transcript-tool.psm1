@@ -711,6 +711,8 @@ function Convert-SubtitleFileToTranscriptText {
     $text = ($lines -join ' ')
     $text = $text -replace '\s{2,}', ' '
     $text = $text -replace '\s+([.,!?;:])', '$1'
+    $text = $text -replace '([(\[{])\s+', '$1'
+    $text = $text -replace '\s+([)\]}])', '$1'
     $text = $text.Trim()
 
     if (-not $text) {
@@ -723,6 +725,71 @@ function Convert-SubtitleFileToTranscriptText {
 
     $sentences = @([regex]::Split($text, '(?<=[.!?])\s+') | Where-Object { $_.Trim() })
     return Format-TranscriptParagraphs -Sentences $sentences
+}
+
+function Get-UniqueTranscriptOutputStem {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$OutputDir,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Stem,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$ArtifactSuffixes
+    )
+
+    for ($index = 1; $true; $index++) {
+        $candidateName = if ($index -eq 1) { $Stem } else { "$Stem-$index" }
+        $candidateStem = Join-Path $OutputDir $candidateName
+        $collision = $false
+
+        foreach ($suffix in $ArtifactSuffixes) {
+            if (Test-Path -LiteralPath "$candidateStem$suffix") {
+                $collision = $true
+                break
+            }
+        }
+
+        if (-not $collision) {
+            return $candidateStem
+        }
+    }
+}
+
+function Save-TranscriptFromSubtitleFileAtStem {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputStemPath,
+
+        [bool]$CleanTranscript
+    )
+
+    $textSuffix = if ($CleanTranscript) {
+        ".clean.txt"
+    }
+    else {
+        ".txt"
+    }
+
+    $textPath = "$OutputStemPath$textSuffix"
+    $text = Convert-SubtitleFileToTranscriptText -Path $Path -TranscriptMode:$CleanTranscript
+    Set-Content -LiteralPath $textPath -Value $text -Encoding utf8
+
+    $reviewPath = $null
+    if ($CleanTranscript) {
+        $reviewPath = "$OutputStemPath.review.txt"
+        Write-TranscriptReviewFile -Path $reviewPath -CleanPath $textPath
+    }
+
+    return [pscustomobject]@{
+        TextPath = $textPath
+        ReviewPath = $reviewPath
+    }
 }
 
 function Save-TranscriptFromSubtitleFile {
@@ -738,29 +805,22 @@ function Save-TranscriptFromSubtitleFile {
 
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
-    $sourceName = Split-Path -Leaf $Path
-    $textName = if ($CleanTranscript) {
-        [System.IO.Path]::ChangeExtension($sourceName, ".clean.txt")
+    $sourceStem = [System.IO.Path]::GetFileNameWithoutExtension((Split-Path -Leaf $Path))
+    $artifactSuffixes = if ($CleanTranscript) {
+        @(".clean.txt", ".review.txt")
     }
     else {
-        [System.IO.Path]::ChangeExtension($sourceName, ".txt")
+        @(".txt")
     }
+    $outputStemPath = Get-UniqueTranscriptOutputStem `
+        -OutputDir $OutputDir `
+        -Stem $sourceStem `
+        -ArtifactSuffixes $artifactSuffixes
 
-    $textPath = Join-Path $OutputDir $textName
-    $text = Convert-SubtitleFileToTranscriptText -Path $Path -TranscriptMode:$CleanTranscript
-    Set-Content -LiteralPath $textPath -Value $text -Encoding utf8
-
-    $reviewPath = $null
-    if ($CleanTranscript) {
-        $reviewName = [System.IO.Path]::ChangeExtension($sourceName, ".review.txt")
-        $reviewPath = Join-Path $OutputDir $reviewName
-        Write-TranscriptReviewFile -Path $reviewPath -CleanPath $textPath
-    }
-
-    return [pscustomobject]@{
-        TextPath = $textPath
-        ReviewPath = $reviewPath
-    }
+    return Save-TranscriptFromSubtitleFileAtStem `
+        -Path $Path `
+        -OutputStemPath $outputStemPath `
+        -CleanTranscript $CleanTranscript
 }
 
 function Get-CliSubtitleLanguageTags {
@@ -932,6 +992,26 @@ function Select-CliPreferredSubtitleFile {
         Select-Object -First 1
 }
 
+function Get-BoundedTranscriptDiagnostic {
+    param(
+        [AllowNull()]
+        [string]$Text,
+
+        [int]$MaximumLength = 2000
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ""
+    }
+
+    $diagnostic = $Text.Trim()
+    if ($diagnostic.Length -le $MaximumLength) {
+        return $diagnostic
+    }
+
+    return $diagnostic.Substring($diagnostic.Length - $MaximumLength)
+}
+
 function Save-TranscriptFromYoutubeCli {
     param(
         [Parameter(Mandatory = $true)]
@@ -972,6 +1052,8 @@ function Save-TranscriptFromYoutubeCli {
 
     $downloadedSubtitles = @()
     $lastExitCode = 0
+    $lastOutput = ""
+    $lastStdErr = ""
 
     try {
         for ($attemptIndex = 0; $attemptIndex -lt $plan.Attempts.Count; $attemptIndex++) {
@@ -980,7 +1062,7 @@ function Save-TranscriptFromYoutubeCli {
             New-Item -ItemType Directory -Path $attemptDir -Force | Out-Null
 
             if ($OnAttempt) {
-                & $OnAttempt $subtitleLanguages
+                & $OnAttempt $subtitleLanguages | Out-Null
             }
 
             $arguments = @(
@@ -1007,6 +1089,8 @@ function Save-TranscriptFromYoutubeCli {
                 -ArgumentList $arguments `
                 -WorkingDirectory $attemptDir
             $lastExitCode = $downloadResult.ExitCode
+            $lastOutput = Get-BoundedTranscriptDiagnostic -Text ([string]$downloadResult.Output)
+            $lastStdErr = Get-BoundedTranscriptDiagnostic -Text ([string]$downloadResult.StdErr)
             $downloadedSubtitles = @(Get-ChildItem -LiteralPath $attemptDir -File |
                 Where-Object { $_.Extension -in ".vtt", ".srt" })
 
@@ -1024,14 +1108,29 @@ function Save-TranscriptFromYoutubeCli {
                 FoundSubtitles = $false
                 ExitCode = if ($NoClean) { $lastExitCode } else { 1 }
                 YtDlpExitCode = $lastExitCode
+                Output = $lastOutput
+                StdErr = $lastStdErr
             }
         }
 
         if ($NoClean) {
+            $stemPaths = @{}
             $subtitlePaths = @(
                 foreach ($subtitle in $downloadedSubtitles) {
-                    $destination = Join-Path $OutputDir $subtitle.Name
-                    Copy-Item -LiteralPath $subtitle.FullName -Destination $destination -Force
+                    $stemName = [System.IO.Path]::GetFileNameWithoutExtension($subtitle.Name)
+                    if (-not $stemPaths.ContainsKey($stemName)) {
+                        $relatedSuffixes = @($downloadedSubtitles |
+                            Where-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) -eq $stemName } |
+                            ForEach-Object { $_.Extension } |
+                            Select-Object -Unique)
+                        $stemPaths[$stemName] = Get-UniqueTranscriptOutputStem `
+                            -OutputDir $OutputDir `
+                            -Stem $stemName `
+                            -ArtifactSuffixes $relatedSuffixes
+                    }
+
+                    $destination = "$($stemPaths[$stemName])$($subtitle.Extension)"
+                    Copy-Item -LiteralPath $subtitle.FullName -Destination $destination
                     $destination
                 }
             )
@@ -1044,21 +1143,41 @@ function Save-TranscriptFromYoutubeCli {
                 FoundSubtitles = $true
                 ExitCode = 0
                 YtDlpExitCode = $lastExitCode
+                Output = $lastOutput
+                StdErr = $lastStdErr
             }
         }
 
         $selected = Select-CliPreferredSubtitleFile `
             -Subtitles $downloadedSubtitles `
             -PreferredLanguage $plan.PreferredLanguage
-        $saved = Save-TranscriptFromSubtitleFile `
-            -Path $selected.FullName `
+        $selectedStem = [System.IO.Path]::GetFileNameWithoutExtension($selected.Name)
+        $artifactSuffixes = @(
+            if ($CleanTranscript) {
+                ".clean.txt"
+                ".review.txt"
+            }
+            else {
+                ".txt"
+            }
+        )
+        if ($KeepSubtitles) {
+            $artifactSuffixes += $selected.Extension
+        }
+
+        $outputStemPath = Get-UniqueTranscriptOutputStem `
             -OutputDir $OutputDir `
+            -Stem $selectedStem `
+            -ArtifactSuffixes $artifactSuffixes
+        $saved = Save-TranscriptFromSubtitleFileAtStem `
+            -Path $selected.FullName `
+            -OutputStemPath $outputStemPath `
             -CleanTranscript $CleanTranscript
         $subtitlePaths = @()
 
         if ($KeepSubtitles) {
-            $destination = Join-Path $OutputDir $selected.Name
-            Copy-Item -LiteralPath $selected.FullName -Destination $destination -Force
+            $destination = "$outputStemPath$($selected.Extension)"
+            Copy-Item -LiteralPath $selected.FullName -Destination $destination
             $subtitlePaths = @($destination)
         }
 
@@ -1070,6 +1189,8 @@ function Save-TranscriptFromYoutubeCli {
             FoundSubtitles = $true
             ExitCode = 0
             YtDlpExitCode = $lastExitCode
+            Output = $lastOutput
+            StdErr = $lastStdErr
         }
     }
     finally {
@@ -1173,15 +1294,24 @@ function Save-TranscriptFromYoutube {
         $videoTitle = if ($info.title) { [string]$info.title } else { "video" }
         $videoId = if ($info.id) { [string]$info.id } else { [System.Guid]::NewGuid().ToString("N") }
         $fileName = New-TranscriptFileName -Title $videoTitle -VideoId $videoId -Language $choice.Language
-        $txtPath = Join-Path $OutputDir $fileName
+        $outputStemName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+        $artifactSuffixes = @(".txt")
+        if ($KeepSubtitles) {
+            $artifactSuffixes += $subtitleFile.Extension
+        }
+
+        $outputStemPath = Get-UniqueTranscriptOutputStem `
+            -OutputDir $OutputDir `
+            -Stem $outputStemName `
+            -ArtifactSuffixes $artifactSuffixes
+        $txtPath = "$outputStemPath.txt"
         $text = Convert-SubtitleFileToTranscriptText -Path $subtitleFile.FullName
         Set-Content -LiteralPath $txtPath -Value $text -Encoding utf8
 
         $subtitlePath = $null
         if ($KeepSubtitles) {
-            $subtitleName = [System.IO.Path]::ChangeExtension($fileName, $subtitleFile.Extension)
-            $subtitlePath = Join-Path $OutputDir $subtitleName
-            Copy-Item -LiteralPath $subtitleFile.FullName -Destination $subtitlePath -Force
+            $subtitlePath = "$outputStemPath$($subtitleFile.Extension)"
+            Copy-Item -LiteralPath $subtitleFile.FullName -Destination $subtitlePath
         }
 
         if ($OnStatus) { & $OnStatus "Done" }

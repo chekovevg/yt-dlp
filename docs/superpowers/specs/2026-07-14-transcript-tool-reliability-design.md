@@ -48,9 +48,9 @@ The converter will parse VTT/SRT structure with state rather than filtering ever
 
 ## File Safety
 
-Every online download uses a GUID-named temporary directory and an explicit output template. Cleanup is limited to that directory. Existing `.vtt`, `.srt`, and `.txt` files outside it are never deleted.
+Every online download uses a GUID-named temporary directory and an explicit output template. Cleanup is limited to that directory. Existing `.vtt`, `.srt`, and `.txt` files outside it are never deleted or overwritten.
 
-When an output transcript name already exists, the tool will continue to overwrite that same deterministic target, matching current GUI behavior. Optional subtitle preservation copies the selected subtitle next to the text only after conversion succeeds.
+Before writing output, the shared core checks every artifact planned for the operation. It uses the unsuffixed stem only when all targets are free; otherwise it selects the next fully free numeric stem (`-2`, `-3`, and so on). A transcript, its review file, and its copied subtitle always share that selected stem. The same collision-safe rule applies to `-CleanOnly`, `-NoClean`, normal CLI downloads, and GUI-core saves.
 
 ## Interfaces
 
@@ -70,14 +70,19 @@ The module regression suite will cover:
 - regional language tags;
 - exclusion of `live_chat`;
 - structured VTT blocks, numeric captions, duplicate captions, and empty output;
-- end-to-end saving with a fake `yt-dlp` executable.
+- end-to-end saving with a fake `yt-dlp` executable;
+- collision-safe `-2`/`-3` output naming across transcript, review, and subtitle artifacts;
+- exact public result shapes, callback-output suppression, bounded diagnostics, and temporary workspace cleanup;
+- restoration of whitespace cleanup immediately inside brackets.
 
 The CLI suite will cover:
 
 - preservation of existing subtitle files in `-CleanOnly` mode;
 - isolation from unrelated subtitle files;
 - operation when launched from a working directory different from the script directory;
-- preservation of existing switches and language ordering.
+- preservation of existing switches and language ordering;
+- `-NoClean`, `-KeepSubs`, `-Srt`, and explicit `-Langs` behavior under output collisions;
+- diagnostics for complete download failure and downloaded-despite-error results.
 
 Final verification includes both test suites, PowerShell parser validation, checksum validation for `yt-dlp.exe`, a real public YouTube transcript download to a temporary directory, and a GUI launch smoke test.
 

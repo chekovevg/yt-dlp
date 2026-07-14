@@ -141,6 +141,26 @@ $saved = Save-TranscriptFromYoutubeCli `
         Write-Host "Trying subtitles: $subtitleLanguages"
     }
 
+$diagnostic = if ($saved.Output) { [string]$saved.Output } else { [string]$saved.StdErr }
+
+if (-not $saved.FoundSubtitles -and $diagnostic) {
+    Write-Warning "yt-dlp diagnostic: $diagnostic"
+}
+
+if ($saved.FoundSubtitles -and $saved.YtDlpExitCode -ne 0) {
+    $warning = if ($NoClean) {
+        "yt-dlp reported an error, but a subtitle file was downloaded. Saving the downloaded subtitle anyway."
+    }
+    else {
+        "yt-dlp reported an error, but a subtitle file was downloaded. Cleaning the downloaded subtitle anyway."
+    }
+    if ($diagnostic) {
+        $warning = "$warning yt-dlp diagnostic: $diagnostic"
+    }
+
+    Write-Warning $warning
+}
+
 if ($NoClean) {
     exit $saved.ExitCode
 }
@@ -150,10 +170,6 @@ if (-not $saved.FoundSubtitles) {
     Write-Host "Check all available subtitle languages with:"
     Write-Host ".\download-subs.cmd -List `"$Url`""
     exit 1
-}
-
-if ($saved.YtDlpExitCode -ne 0) {
-    Write-Warning "yt-dlp reported an error, but a subtitle file was downloaded. Cleaning the downloaded subtitle anyway."
 }
 
 if ($saved.TextPath) {
