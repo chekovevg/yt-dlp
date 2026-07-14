@@ -163,9 +163,11 @@ $lastOutputDir = $folderBox.Text
 $activeJob = $null
 $activeResult = $null
 $activeError = $null
-$activeWorkerProcessId = 0
+$activeWorkerIdentity = $null
+$activeProcessGroup = $null
 $activeStartGate = $null
-$activeWorkerPidPath = $null
+$activeWorkerIdentityPath = $null
+$deferredCleanupTicket = $null
 
 $jobTimer = New-Object System.Windows.Forms.Timer
 $jobTimer.Interval = 200
@@ -198,7 +200,24 @@ $jobTimer.Add_Tick({
     foreach ($message in $messages) {
         switch ([string]$message.Kind) {
             "Worker" {
-                $script:activeWorkerProcessId = [int]$message.Value
+                $script:activeWorkerIdentity = $message.Value
+
+                try {
+                    $script:activeProcessGroup = New-TranscriptProcessGroup `
+                        -WorkerIdentity $script:activeWorkerIdentity
+                }
+                catch {
+                    $script:activeError = $_
+                    $jobTimer.Stop()
+                    Request-ActiveTranscriptJobCleanup
+                    $saveButton.Enabled = $true
+                    $browseButton.Enabled = $true
+                    $openFolderButton.Enabled = $false
+                    Set-UiStatus -Label $statusLabel -Text $uiText.Error
+                    Show-UserError $_.Exception.Message
+                    $form.Close()
+                    return
+                }
 
                 if ($script:activeStartGate) {
                     $startGate = $script:activeStartGate
@@ -212,12 +231,12 @@ $jobTimer.Add_Tick({
                     }
                 }
 
-                if ($script:activeWorkerPidPath) {
+                if ($script:activeWorkerIdentityPath) {
                     Remove-Item `
-                        -LiteralPath $script:activeWorkerPidPath `
+                        -LiteralPath $script:activeWorkerIdentityPath `
                         -Force `
                         -ErrorAction SilentlyContinue
-                    $script:activeWorkerPidPath = $null
+                    $script:activeWorkerIdentityPath = $null
                 }
             }
             "Status" {
@@ -253,22 +272,26 @@ $jobTimer.Add_Tick({
     $jobReason = $job.JobStateInfo.Reason
 
     Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    if ($script:activeProcessGroup) {
+        $script:activeProcessGroup.Dispose()
+    }
     $script:activeJob = $null
     $script:activeResult = $null
     $script:activeError = $null
-    $script:activeWorkerProcessId = 0
+    $script:activeWorkerIdentity = $null
+    $script:activeProcessGroup = $null
 
     if ($script:activeStartGate) {
         $script:activeStartGate.Dispose()
         $script:activeStartGate = $null
     }
 
-    if ($script:activeWorkerPidPath) {
+    if ($script:activeWorkerIdentityPath) {
         Remove-Item `
-            -LiteralPath $script:activeWorkerPidPath `
+            -LiteralPath $script:activeWorkerIdentityPath `
             -Force `
             -ErrorAction SilentlyContinue
-        $script:activeWorkerPidPath = $null
+        $script:activeWorkerIdentityPath = $null
     }
 
     $saveButton.Enabled = $true
@@ -301,7 +324,7 @@ $jobTimer.Add_Tick({
     Show-UserError $errorMessage
 })
 
-function Stop-ActiveTranscriptJob {
+function Request-ActiveTranscriptJobCleanup {
     $job = $script:activeJob
     if (-not $job) {
         return
@@ -312,47 +335,19 @@ function Stop-ActiveTranscriptJob {
         $script:activeStartGate = $null
     }
 
-    if (-not $script:activeWorkerProcessId -and
-        $script:activeWorkerPidPath -and
-        (Test-Path -LiteralPath $script:activeWorkerPidPath)) {
-        $workerPidText = Get-Content `
-            -LiteralPath $script:activeWorkerPidPath `
-            -Raw `
-            -ErrorAction SilentlyContinue
-        $parsedWorkerProcessId = 0
-
-        if ([int]::TryParse($workerPidText, [ref]$parsedWorkerProcessId)) {
-            $script:activeWorkerProcessId = $parsedWorkerProcessId
-        }
-    }
-
-    if (-not $script:activeWorkerProcessId) {
-        $pendingMessages = @(Receive-Job -Job $job -ErrorAction SilentlyContinue)
-        $workerMessage = $pendingMessages |
-            Where-Object Kind -eq "Worker" |
-            Select-Object -First 1
-
-        if ($workerMessage) {
-            $script:activeWorkerProcessId = [int]$workerMessage.Value
-        }
-    }
-
-    if ($script:activeWorkerPidPath) {
-        Remove-Item `
-            -LiteralPath $script:activeWorkerPidPath `
-            -Force `
-            -ErrorAction SilentlyContinue
-        $script:activeWorkerPidPath = $null
-    }
-
-    Stop-TranscriptBackgroundJob `
+    $script:deferredCleanupTicket = Request-TranscriptBackgroundJobStop `
         -Job $job `
-        -WorkerProcessId $script:activeWorkerProcessId
+        -ProcessGroup $script:activeProcessGroup `
+        -WorkerIdentity $script:activeWorkerIdentity `
+        -WorkerIdentityPath $script:activeWorkerIdentityPath `
+        -UiDeadlineMilliseconds 1500
 
     $script:activeJob = $null
     $script:activeResult = $null
     $script:activeError = $null
-    $script:activeWorkerProcessId = 0
+    $script:activeWorkerIdentity = $null
+    $script:activeProcessGroup = $null
+    $script:activeWorkerIdentityPath = $null
 }
 
 $browseButton.Add_Click({
@@ -400,11 +395,12 @@ $saveButton.Add_Click({
         $modulePath = Join-Path $root "transcript-tool.psm1"
         $script:activeResult = $null
         $script:activeError = $null
-        $script:activeWorkerProcessId = 0
+        $script:activeWorkerIdentity = $null
+        $script:activeProcessGroup = $null
         $startGateName = "Local\YouTubeTranscriptTool-" + [Guid]::NewGuid().ToString("N")
-        $script:activeWorkerPidPath = Join-Path `
+        $script:activeWorkerIdentityPath = Join-Path `
             ([System.IO.Path]::GetTempPath()) `
-            ("youtube-transcript-tool-worker-" + [Guid]::NewGuid().ToString("N") + ".pid")
+            ("youtube-transcript-tool-worker-" + [Guid]::NewGuid().ToString("N") + ".json")
         $script:activeStartGate = New-Object System.Threading.EventWaitHandle -ArgumentList @(
             $false,
             [System.Threading.EventResetMode]::ManualReset,
@@ -418,7 +414,7 @@ $saveButton.Add_Click({
                 $language,
                 $keepSubtitles,
                 $startGateName,
-                $script:activeWorkerPidPath
+                $script:activeWorkerIdentityPath
             ) `
             -ScriptBlock {
                 param(
@@ -428,17 +424,25 @@ $saveButton.Add_Click({
                     $language,
                     $keepSubtitles,
                     $startGateName,
-                    $workerPidPath
+                    $workerIdentityPath
                 )
 
                 $ErrorActionPreference = "Stop"
-                [System.IO.File]::WriteAllText($workerPidPath, [string]$PID)
+                $workerProcess = [System.Diagnostics.Process]::GetCurrentProcess()
+                $workerIdentity = [pscustomobject]@{
+                    Id = $PID
+                    CreationFileTimeUtc = $workerProcess.StartTime.ToUniversalTime().ToFileTimeUtc()
+                }
+                [System.IO.File]::WriteAllText(
+                    $workerIdentityPath,
+                    ($workerIdentity | ConvertTo-Json -Compress)
+                )
                 $startGate = [System.Threading.EventWaitHandle]::OpenExisting($startGateName)
 
                 try {
                     [pscustomobject]@{
                         Kind = "Worker"
-                        Value = $PID
+                        Value = $workerIdentity
                     }
 
                     [void]$startGate.WaitOne()
@@ -480,55 +484,66 @@ $saveButton.Add_Click({
         $jobTimer.Stop()
 
         if ($script:activeJob) {
-            Stop-ActiveTranscriptJob
+            Request-ActiveTranscriptJobCleanup
         }
         elseif ($script:activeStartGate) {
             $script:activeStartGate.Dispose()
             $script:activeStartGate = $null
         }
 
-        if ($script:activeWorkerPidPath) {
+        if ($script:activeWorkerIdentityPath) {
             Remove-Item `
-                -LiteralPath $script:activeWorkerPidPath `
+                -LiteralPath $script:activeWorkerIdentityPath `
                 -Force `
                 -ErrorAction SilentlyContinue
-            $script:activeWorkerPidPath = $null
+            $script:activeWorkerIdentityPath = $null
         }
 
         $script:activeResult = $null
         $script:activeError = $null
-        $script:activeWorkerProcessId = 0
+        $script:activeWorkerIdentity = $null
+        $script:activeProcessGroup = $null
         Set-UiStatus -Label $statusLabel -Text $uiText.Error
         Show-UserError $_.Exception.Message
         $saveButton.Enabled = $true
         $browseButton.Enabled = $true
+
+        if ($script:deferredCleanupTicket) {
+            $form.Close()
+        }
     }
 })
 
 $form.Add_FormClosing({
     $jobTimer.Stop()
 
-    if ($script:activeJob) {
-        Stop-ActiveTranscriptJob
+    if ($script:activeJob -and -not $script:deferredCleanupTicket) {
+        Request-ActiveTranscriptJobCleanup
     }
     elseif ($script:activeStartGate) {
         $script:activeStartGate.Dispose()
         $script:activeStartGate = $null
     }
 
-    if ($script:activeWorkerPidPath) {
+    if ($script:activeWorkerIdentityPath -and -not $script:deferredCleanupTicket) {
         Remove-Item `
-            -LiteralPath $script:activeWorkerPidPath `
+            -LiteralPath $script:activeWorkerIdentityPath `
             -Force `
             -ErrorAction SilentlyContinue
-        $script:activeWorkerPidPath = $null
+        $script:activeWorkerIdentityPath = $null
     }
 
     $script:activeResult = $null
     $script:activeError = $null
-    $script:activeWorkerProcessId = 0
+    $script:activeWorkerIdentity = $null
+    $script:activeProcessGroup = $null
 })
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::Run($form)
 $jobTimer.Dispose()
+
+if ($script:deferredCleanupTicket) {
+    Complete-TranscriptBackgroundJobCleanup -Ticket $script:deferredCleanupTicket
+    $script:deferredCleanupTicket = $null
+}
