@@ -258,13 +258,13 @@ Expected: case 1 loses its source, case 2 deletes unrelated files or converts th
 
 - [ ] **Step 3: Add shared subtitle-file saving**
 
-Move the opt-in transcript normalization helpers from `download-subs.ps1` into `transcript-tool.psm1`. Implement `Save-TranscriptFromSubtitleFile` so it converts through the shared structural parser, writes `.txt` or `.clean.txt` in `OutputDir`, writes `.review.txt` only for transcript mode, and never deletes `Path` or overwrites an output. Use one shared unique-stem helper so clean text and review files receive the same numeric suffix.
+Move the opt-in transcript normalization helpers from `download-subs.ps1` into `transcript-tool.psm1`. Implement `Save-TranscriptFromSubtitleFile` so it converts through the shared structural parser, writes `.txt` or `.clean.txt` in `OutputDir`, writes `.review.txt` only for transcript mode, and never deletes `Path` or overwrites an output. Use one shared reservation helper that opens every final target for a stem with `FileMode.CreateNew`. On collision, close and delete only this invocation's partial reservations before retrying the next numeric suffix. Write text and review bytes through the reserved streams so coordinated artifacts receive the same atomic numeric suffix across concurrent processes.
 
 - [ ] **Step 4: Add safe CLI online saving**
 
 Implement `Save-TranscriptFromYoutubeCli` with one top-level GUID temporary directory and one attempt subdirectory per language expression. Determine attempts from explicit `SubtitleLanguages`, explicit `Preference`, or detected video language followed by `ru`, `en`, and `de`. For each attempt invoke `yt-dlp` with both subtitle-source flags, explicit `-o` inside the attempt directory, and `vtt/best` or `srt/best` settings. Stop only when that attempt directory contains a new `.vtt` or `.srt`.
 
-For `NoClean`, copy every current-run subtitle to collision-safe paths in `OutputDir`. Otherwise select the preferred current-run file, reserve one free stem for all planned artifacts, call `Save-TranscriptFromSubtitleFile`, and copy only that subtitle when `KeepSubtitles` is true. Suppress output from `OnAttempt` so the function returns exactly one object. Carry the last process `Output` and `StdErr`, bounded to 2,000 characters each, in every result. Remove only the top-level temporary directory in `finally`.
+For `NoClean`, atomically reserve each coordinated current-run subtitle group in `OutputDir` and copy through the reserved streams. Otherwise select the preferred current-run file, atomically reserve every transcript/review/subtitle target for one stem, convert and copy through those streams, and release only this invocation's reservations on failure. Suppress output from `OnAttempt` so the function returns exactly one object. Carry the last process `Output` and `StdErr`, bounded to 2,000 characters each, in every result. Remove only the top-level temporary directory in `finally`.
 
 - [ ] **Step 5: Replace CLI orchestration with module calls**
 
@@ -306,7 +306,7 @@ Expected: PASS. This establishes that the existing window launches before changi
 
 On click, save settings, disable buttons, and start a job that imports the module and calls `Save-TranscriptFromYoutube`. Emit objects shaped as `{ Kind = 'Status'; Value = <status> }` and `{ Kind = 'Result'; Value = <result> }`. Start the WinForms timer.
 
-On each timer tick, call `Receive-Job` without `-Keep`, map status objects through the existing localized status switch, store the result object, and when job state is complete or failed: stop the timer, show the result or the job's first error, remove the job, re-enable controls, and enable Open Folder only after success. On form close, stop and remove an active job before exiting.
+On each timer tick, call `Receive-Job` without `-Keep`, map status objects through the existing localized status switch, store the result object, and when job state is complete or failed: stop the timer, show the result or the job's first error, remove the terminal job, re-enable controls, and enable Open Folder only after success. On form close, dispose the start gate and capture a cleanup ticket without calling process termination synchronously. After `Application.Run` returns, terminate/dispose the process group, perform any safe identity fallback, and remove the active job.
 
 - [ ] **Step 4: Run GUI smoke and backend suites**
 

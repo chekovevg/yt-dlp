@@ -114,6 +114,16 @@ public class Program {
             return 0;
         }
 
+        if (url.Contains("fresh-concurrent")) {
+            var marker = url.Contains("content=one") ? "FIRST-CLI-CONCURRENT" : "SECOND-CLI-CONCURRENT";
+            var content = new StringBuilder("WEBVTT\n\n00:00:00.000 --> 00:30:00.000\n");
+            for (var index = 0; index < 30000; index++) {
+                content.Append(marker).Append(" ").Append(index).Append(".\n");
+            }
+            WriteSubtitle(args, "Concurrent [same].en.vtt", content.ToString());
+            return 0;
+        }
+
         if (url.Contains("fresh")) {
             WriteSubtitle(
                 args,
@@ -271,6 +281,12 @@ function Utf8 {
     )
 
     [System.Text.Encoding]::UTF8.GetString($Bytes)
+}
+
+function Get-CliTestTemporaryDirectories {
+    return @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Directory -Filter "youtube-transcript-cli-*" -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.FullName } |
+        Sort-Object)
 }
 
 $tests = @(
@@ -523,6 +539,113 @@ $tests = @(
             finally {
                 Remove-Item -LiteralPath $dir -Recurse -Force
             }
+        }
+    },
+    @{
+        Name = "Concurrent KeepSubs processes atomically coordinate transcript and subtitle stems"
+        Run = {
+            $dir = New-TestWorkspace
+            $outputDir = Join-Path $dir "concurrent-output"
+            $runnerPath = Join-Path $dir "concurrent-runner.ps1"
+            New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+            $processes = @()
+            $gate = $null
+            $beforeTemp = Get-CliTestTemporaryDirectories
+
+            try {
+                $oldText = Join-Path $outputDir "Concurrent [same].en.txt"
+                $oldSubtitle = Join-Path $outputDir "Concurrent [same].en.vtt"
+                $oldTextBytes = [byte[]]@(101, 102, 103, 104)
+                $oldSubtitleBytes = [byte[]]@(111, 112, 113, 114)
+                [System.IO.File]::WriteAllBytes($oldText, $oldTextBytes)
+                [System.IO.File]::WriteAllBytes($oldSubtitle, $oldSubtitleBytes)
+
+                Set-Content -LiteralPath $runnerPath -Encoding utf8 -Value @(
+                    'param([string]$Directory64,[string]$Output64,[string]$Url64,[string]$GateName)',
+                    '$ErrorActionPreference = "Stop"',
+                    '$decode = { param($value) [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) }',
+                    '$directory = & $decode $Directory64',
+                    '$outputDir = & $decode $Output64',
+                    '$url = & $decode $Url64',
+                    '$gate = [System.Threading.EventWaitHandle]::OpenExisting($GateName)',
+                    'try { [void]$gate.WaitOne() } finally { $gate.Dispose() }',
+                    '$env:PATH = $directory + [System.IO.Path]::PathSeparator + $env:PATH',
+                    'Set-Location -LiteralPath $directory',
+                    '& (Join-Path $directory "download-subs.ps1") $url -Prefer en -KeepSubs -OutputDir $outputDir',
+                    'exit $LASTEXITCODE'
+                )
+                $gateName = "Local\TranscriptAtomicCli-" + [Guid]::NewGuid().ToString("N")
+                $gate = New-Object System.Threading.EventWaitHandle -ArgumentList @($false, [System.Threading.EventResetMode]::ManualReset, $gateName)
+                $encode = {
+                    param($value)
+                    [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$value))
+                }
+                $urls = @(
+                    "https://example.test/fresh-concurrent?content=one",
+                    "https://example.test/fresh-concurrent?content=two"
+                )
+                for ($processIndex = 0; $processIndex -lt 2; $processIndex++) {
+                    $psi = New-Object System.Diagnostics.ProcessStartInfo
+                    $psi.FileName = "powershell.exe"
+                    $psi.Arguments = @(
+                        '-NoProfile',
+                        '-ExecutionPolicy', 'Bypass',
+                        '-File', ('"' + $runnerPath + '"'),
+                        '-Directory64', (& $encode $dir),
+                        '-Output64', (& $encode $outputDir),
+                        '-Url64', (& $encode $urls[$processIndex]),
+                        '-GateName', $gateName
+                    ) -join ' '
+                    $psi.UseShellExecute = $false
+                    $psi.CreateNoWindow = $true
+                    $psi.RedirectStandardOutput = $true
+                    $psi.RedirectStandardError = $true
+                    $processes += [System.Diagnostics.Process]::Start($psi)
+                }
+
+                [void]$gate.Set()
+                for ($processIndex = 0; $processIndex -lt $processes.Count; $processIndex++) {
+                    $process = $processes[$processIndex]
+                    Assert-True ($process.WaitForExit(60000)) "Concurrent KeepSubs process $processIndex timed out."
+                    $stdout = $process.StandardOutput.ReadToEnd()
+                    $stderr = $process.StandardError.ReadToEnd()
+                    Assert-True ($process.ExitCode -eq 0) "Concurrent KeepSubs process $processIndex failed: $stdout $stderr"
+                }
+
+                Assert-BytesEqual -Expected $oldTextBytes -Actual ([System.IO.File]::ReadAllBytes($oldText)) -Message "Concurrent KeepSubs changed the pre-existing transcript."
+                Assert-BytesEqual -Expected $oldSubtitleBytes -Actual ([System.IO.File]::ReadAllBytes($oldSubtitle)) -Message "Concurrent KeepSubs changed the pre-existing subtitle."
+                foreach ($suffix in 2, 3) {
+                    $textPath = Join-Path $outputDir "Concurrent [same].en-$suffix.txt"
+                    $subtitlePath = Join-Path $outputDir "Concurrent [same].en-$suffix.vtt"
+                    Assert-True (Test-Path -LiteralPath $textPath) "Missing concurrent transcript suffix -$suffix."
+                    Assert-True (Test-Path -LiteralPath $subtitlePath) "Missing coordinated subtitle suffix -$suffix."
+                    $textContent = Get-Content -LiteralPath $textPath -Raw -Encoding utf8
+                    $subtitleContent = Get-Content -LiteralPath $subtitlePath -Raw -Encoding utf8
+                    $marker = if ($textContent -match "FIRST-CLI-CONCURRENT") { "FIRST-CLI-CONCURRENT" } elseif ($textContent -match "SECOND-CLI-CONCURRENT") { "SECOND-CLI-CONCURRENT" } else { "" }
+                    Assert-True ([bool]$marker) "Concurrent transcript -$suffix has no invocation marker."
+                    Assert-True ($subtitleContent -match $marker) "Transcript/subtitle suffix -$suffix came from different invocations."
+                }
+                $combinedText = @(
+                    Get-Content -LiteralPath (Join-Path $outputDir "Concurrent [same].en-2.txt") -Raw -Encoding utf8
+                    Get-Content -LiteralPath (Join-Path $outputDir "Concurrent [same].en-3.txt") -Raw -Encoding utf8
+                ) -join "`n"
+                Assert-True ($combinedText -match "FIRST-CLI-CONCURRENT") "First concurrent CLI content was lost."
+                Assert-True ($combinedText -match "SECOND-CLI-CONCURRENT") "Second concurrent CLI content was lost."
+                $outputFiles = @(Get-ChildItem -LiteralPath $outputDir -File)
+                Assert-True ($outputFiles.Count -eq 6) "Concurrent KeepSubs left unexpected reservation files: $($outputFiles.Name -join ', ')"
+                Assert-True (@($outputFiles | Where-Object Length -eq 0).Count -eq 0) "Concurrent KeepSubs left zero-byte reservations."
+            }
+            finally {
+                if ($gate) { $gate.Dispose() }
+                foreach ($process in $processes) {
+                    if ($process -and -not $process.HasExited) { $process.Kill() }
+                    if ($process) { $process.Dispose() }
+                }
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+
+            $afterTemp = Get-CliTestTemporaryDirectories
+            Assert-True (($beforeTemp -join '|') -eq ($afterTemp -join '|')) "Concurrent KeepSubs leaked CLI temporary workspaces."
         }
     },
     @{

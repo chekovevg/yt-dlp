@@ -213,17 +213,22 @@ function Invoke-YtDlpJson {
     )
 
     if ($result.ExitCode -ne 0) {
-        $message = $result.Output.Trim()
+        $fullMessage = ([string]$result.Output).Trim()
+        $message = Get-BoundedTranscriptDiagnostic -Text $fullMessage
 
-        if ($message -match "Unsupported URL|Invalid URL") {
+        if ($fullMessage -match "Unsupported URL|Invalid URL") {
             throw "The YouTube link looks invalid. Please paste a normal youtube.com or youtu.be video link."
         }
 
-        if ($message -match "Private video|Video unavailable|This video is unavailable|Sign in") {
+        if ($fullMessage -match "Private video|Video unavailable|This video is unavailable|Sign in") {
             throw "This video is unavailable without login or cannot be accessed by yt-dlp."
         }
 
-        if ($message -match "HTTP Error|Unable to download|Temporary failure|timed out|network") {
+        if ($fullMessage -match "HTTP Error 429|Too Many Requests|rate.?limit") {
+            throw "YouTube temporarily rate-limited requests. Wait a little and try again."
+        }
+
+        if ($fullMessage -match "HTTP Error|Unable to download|Temporary failure|timed out|network") {
             throw "Network problem while checking the video. Try again in a few minutes."
         }
 
@@ -253,11 +258,11 @@ function Get-SubtitleMapLanguages {
         }
 
         $formats = @($property.Value)
-        if ($formats.Count -gt 0) {
-            $hasTranscriptFormat = @($formats | Where-Object { $_.ext -in @("vtt", "srt") }).Count -gt 0
-            if (-not $hasTranscriptFormat) {
-                continue
-            }
+        $hasTranscriptFormat = @($formats | Where-Object {
+                $_ -and ([string]$_.ext).ToLowerInvariant() -in @("vtt", "srt")
+            }).Count -gt 0
+        if (-not $hasTranscriptFormat) {
+            continue
         }
 
         $property.Name
@@ -599,11 +604,8 @@ function Format-CleanTranscriptText {
     return ($paragraphs -join "`r`n`r`n")
 }
 
-function Write-TranscriptReviewFile {
+function Get-TranscriptReviewText {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
-
         [Parameter(Mandatory = $true)]
         [string]$CleanPath
     )
@@ -626,7 +628,7 @@ function Write-TranscriptReviewFile {
         "This file is a deterministic cleanup aid, not a verified transcript."
     )
 
-    Set-Content -LiteralPath $Path -Value $lines -Encoding utf8
+    return (($lines -join [System.Environment]::NewLine) + [System.Environment]::NewLine)
 }
 
 function Convert-SubtitleFileToTranscriptText {
@@ -646,6 +648,7 @@ function Convert-SubtitleFileToTranscriptText {
     $prev = $null
     $block = $null
     $atCueBoundary = $true
+    $inDocumentHeader = $true
 
     for ($i = 0; $i -lt $sourceLines.Count; $i++) {
         $rawLine = [string]$sourceLines[$i]
@@ -664,12 +667,14 @@ function Convert-SubtitleFileToTranscriptText {
             continue
         }
 
-        if ($atCueBoundary -and $rawLine -match '^\s*(NOTE|STYLE|REGION)(?:\s|$)') {
-            $block = $Matches[1]
+        if ($inDocumentHeader -and $rawLine -match '^\s*(?:WEBVTT(?:\s.*)?|Kind:.*|Language:.*)\s*$') {
             continue
         }
 
-        if ($rawLine -match '^\s*(?:WEBVTT(?:\s.*)?|Kind:.*|Language:.*)\s*$') {
+        $inDocumentHeader = $false
+
+        if ($atCueBoundary -and $rawLine -match '^\s*(NOTE|STYLE|REGION)(?:\s|$)') {
+            $block = $Matches[1]
             continue
         }
 
@@ -727,7 +732,45 @@ function Convert-SubtitleFileToTranscriptText {
     return Format-TranscriptParagraphs -Sentences $sentences
 }
 
-function Get-UniqueTranscriptOutputStem {
+function Close-TranscriptOutputReservation {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Reservation,
+
+        [bool]$DeleteFiles
+    )
+
+    $cleanupError = $null
+    foreach ($entry in @($Reservation.Entries)) {
+        if ($entry.Stream) {
+            try {
+                $entry.Stream.Dispose()
+            }
+            catch {
+                if (-not $cleanupError) {
+                    $cleanupError = $_
+                }
+            }
+        }
+
+        if ($DeleteFiles) {
+            try {
+                [System.IO.File]::Delete([string]$entry.Path)
+            }
+            catch {
+                if (-not $cleanupError) {
+                    $cleanupError = $_
+                }
+            }
+        }
+    }
+
+    if ($cleanupError) {
+        throw $cleanupError
+    }
+}
+
+function New-TranscriptOutputReservation {
     param(
         [Parameter(Mandatory = $true)]
         [string]$OutputDir,
@@ -740,31 +783,143 @@ function Get-UniqueTranscriptOutputStem {
         [string[]]$ArtifactSuffixes
     )
 
+    $suffixes = @($ArtifactSuffixes | Select-Object -Unique)
+
     for ($index = 1; $true; $index++) {
         $candidateName = if ($index -eq 1) { $Stem } else { "$Stem-$index" }
         $candidateStem = Join-Path $OutputDir $candidateName
+        $entries = New-Object System.Collections.Generic.List[object]
         $collision = $false
 
-        foreach ($suffix in $ArtifactSuffixes) {
-            if (Test-Path -LiteralPath "$candidateStem$suffix") {
-                $collision = $true
-                break
+        try {
+            foreach ($suffix in $suffixes) {
+                $path = "$candidateStem$suffix"
+                try {
+                    $stream = [System.IO.File]::Open(
+                        $path,
+                        [System.IO.FileMode]::CreateNew,
+                        [System.IO.FileAccess]::Write,
+                        [System.IO.FileShare]::None
+                    )
+                }
+                catch [System.IO.IOException] {
+                    $nativeError = $_.Exception.HResult -band 0xFFFF
+                    if ($nativeError -in 80, 183) {
+                        $collision = $true
+                        break
+                    }
+
+                    throw
+                }
+
+                $entries.Add([pscustomobject]@{
+                        Suffix = [string]$suffix
+                        Path = $path
+                        Stream = $stream
+                    })
             }
         }
+        catch {
+            Close-TranscriptOutputReservation `
+                -Reservation ([pscustomobject]@{ Entries = $entries.ToArray() }) `
+                -DeleteFiles $true
+            throw
+        }
 
-        if (-not $collision) {
-            return $candidateStem
+        if ($collision) {
+            Close-TranscriptOutputReservation `
+                -Reservation ([pscustomobject]@{ Entries = $entries.ToArray() }) `
+                -DeleteFiles $true
+            continue
+        }
+
+        return [pscustomobject]@{
+            StemPath = $candidateStem
+            Entries = $entries.ToArray()
         }
     }
 }
 
-function Save-TranscriptFromSubtitleFileAtStem {
+function Get-TranscriptReservationEntry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Reservation,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Suffix
+    )
+
+    $entry = $Reservation.Entries |
+        Where-Object { [string]$_.Suffix -eq $Suffix } |
+        Select-Object -First 1
+    if (-not $entry) {
+        throw "The output reservation does not contain suffix '$Suffix'."
+    }
+
+    return $entry
+}
+
+function Write-TranscriptReservationText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Reservation,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Suffix,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Text
+    )
+
+    $entry = Get-TranscriptReservationEntry -Reservation $Reservation -Suffix $Suffix
+    $encoding = New-Object System.Text.UTF8Encoding($true)
+    $preamble = $encoding.GetPreamble()
+    $bytes = $encoding.GetBytes($Text)
+    if ($preamble.Length -gt 0) {
+        $entry.Stream.Write($preamble, 0, $preamble.Length)
+    }
+    if ($bytes.Length -gt 0) {
+        $entry.Stream.Write($bytes, 0, $bytes.Length)
+    }
+    $entry.Stream.Flush()
+}
+
+function Copy-TranscriptFileToReservation {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Path,
 
         [Parameter(Mandatory = $true)]
-        [string]$OutputStemPath,
+        [object]$Reservation,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Suffix
+    )
+
+    $entry = Get-TranscriptReservationEntry -Reservation $Reservation -Suffix $Suffix
+    $sourceStream = [System.IO.File]::Open(
+        $Path,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        $sourceStream.CopyTo($entry.Stream)
+        $entry.Stream.Flush()
+    }
+    finally {
+        $sourceStream.Dispose()
+    }
+}
+
+function Save-TranscriptFromSubtitleFileAtReservation {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [object]$Reservation,
 
         [bool]$CleanTranscript
     )
@@ -776,14 +931,20 @@ function Save-TranscriptFromSubtitleFileAtStem {
         ".txt"
     }
 
-    $textPath = "$OutputStemPath$textSuffix"
+    $textPath = "$($Reservation.StemPath)$textSuffix"
     $text = Convert-SubtitleFileToTranscriptText -Path $Path -TranscriptMode:$CleanTranscript
-    Set-Content -LiteralPath $textPath -Value $text -Encoding utf8
+    Write-TranscriptReservationText `
+        -Reservation $Reservation `
+        -Suffix $textSuffix `
+        -Text ($text + [System.Environment]::NewLine)
 
     $reviewPath = $null
     if ($CleanTranscript) {
-        $reviewPath = "$OutputStemPath.review.txt"
-        Write-TranscriptReviewFile -Path $reviewPath -CleanPath $textPath
+        $reviewPath = "$($Reservation.StemPath).review.txt"
+        Write-TranscriptReservationText `
+            -Reservation $Reservation `
+            -Suffix ".review.txt" `
+            -Text (Get-TranscriptReviewText -CleanPath $textPath)
     }
 
     return [pscustomobject]@{
@@ -812,15 +973,25 @@ function Save-TranscriptFromSubtitleFile {
     else {
         @(".txt")
     }
-    $outputStemPath = Get-UniqueTranscriptOutputStem `
+    $reservation = New-TranscriptOutputReservation `
         -OutputDir $OutputDir `
         -Stem $sourceStem `
         -ArtifactSuffixes $artifactSuffixes
 
-    return Save-TranscriptFromSubtitleFileAtStem `
-        -Path $Path `
-        -OutputStemPath $outputStemPath `
-        -CleanTranscript $CleanTranscript
+    $succeeded = $false
+    try {
+        $result = Save-TranscriptFromSubtitleFileAtReservation `
+            -Path $Path `
+            -Reservation $reservation `
+            -CleanTranscript $CleanTranscript
+        $succeeded = $true
+        return $result
+    }
+    finally {
+        Close-TranscriptOutputReservation `
+            -Reservation $reservation `
+            -DeleteFiles (-not $succeeded)
+    }
 }
 
 function Get-CliSubtitleLanguageTags {
@@ -1114,31 +1285,40 @@ function Save-TranscriptFromYoutubeCli {
         }
 
         if ($NoClean) {
-            $stemPaths = @{}
-            $subtitlePaths = @(
-                foreach ($subtitle in $downloadedSubtitles) {
-                    $stemName = [System.IO.Path]::GetFileNameWithoutExtension($subtitle.Name)
-                    if (-not $stemPaths.ContainsKey($stemName)) {
-                        $relatedSuffixes = @($downloadedSubtitles |
-                            Where-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) -eq $stemName } |
-                            ForEach-Object { $_.Extension } |
-                            Select-Object -Unique)
-                        $stemPaths[$stemName] = Get-UniqueTranscriptOutputStem `
-                            -OutputDir $OutputDir `
-                            -Stem $stemName `
-                            -ArtifactSuffixes $relatedSuffixes
+            $subtitlePaths = New-Object System.Collections.Generic.List[string]
+            $subtitleGroups = $downloadedSubtitles |
+                Group-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) }
+            foreach ($subtitleGroup in $subtitleGroups) {
+                $relatedSubtitles = @($subtitleGroup.Group)
+                $relatedSuffixes = @($relatedSubtitles |
+                    ForEach-Object { $_.Extension } |
+                    Select-Object -Unique)
+                $reservation = New-TranscriptOutputReservation `
+                    -OutputDir $OutputDir `
+                    -Stem ([string]$subtitleGroup.Name) `
+                    -ArtifactSuffixes $relatedSuffixes
+                $groupSucceeded = $false
+                try {
+                    foreach ($subtitle in $relatedSubtitles) {
+                        Copy-TranscriptFileToReservation `
+                            -Path $subtitle.FullName `
+                            -Reservation $reservation `
+                            -Suffix $subtitle.Extension
+                        $subtitlePaths.Add("$($reservation.StemPath)$($subtitle.Extension)")
                     }
-
-                    $destination = "$($stemPaths[$stemName])$($subtitle.Extension)"
-                    Copy-Item -LiteralPath $subtitle.FullName -Destination $destination
-                    $destination
+                    $groupSucceeded = $true
                 }
-            )
+                finally {
+                    Close-TranscriptOutputReservation `
+                        -Reservation $reservation `
+                        -DeleteFiles (-not $groupSucceeded)
+                }
+            }
 
             return [pscustomobject]@{
                 TextPath = $null
                 ReviewPath = $null
-                SubtitlePaths = $subtitlePaths
+                SubtitlePaths = $subtitlePaths.ToArray()
                 OutputDir = $OutputDir
                 FoundSubtitles = $true
                 ExitCode = 0
@@ -1165,20 +1345,32 @@ function Save-TranscriptFromYoutubeCli {
             $artifactSuffixes += $selected.Extension
         }
 
-        $outputStemPath = Get-UniqueTranscriptOutputStem `
+        $reservation = New-TranscriptOutputReservation `
             -OutputDir $OutputDir `
             -Stem $selectedStem `
             -ArtifactSuffixes $artifactSuffixes
-        $saved = Save-TranscriptFromSubtitleFileAtStem `
-            -Path $selected.FullName `
-            -OutputStemPath $outputStemPath `
-            -CleanTranscript $CleanTranscript
-        $subtitlePaths = @()
+        $reservationSucceeded = $false
+        try {
+            $saved = Save-TranscriptFromSubtitleFileAtReservation `
+                -Path $selected.FullName `
+                -Reservation $reservation `
+                -CleanTranscript $CleanTranscript
+            $subtitlePaths = @()
 
-        if ($KeepSubtitles) {
-            $destination = "$outputStemPath$($selected.Extension)"
-            Copy-Item -LiteralPath $selected.FullName -Destination $destination
-            $subtitlePaths = @($destination)
+            if ($KeepSubtitles) {
+                $destination = "$($reservation.StemPath)$($selected.Extension)"
+                Copy-TranscriptFileToReservation `
+                    -Path $selected.FullName `
+                    -Reservation $reservation `
+                    -Suffix $selected.Extension
+                $subtitlePaths = @($destination)
+            }
+            $reservationSucceeded = $true
+        }
+        finally {
+            Close-TranscriptOutputReservation `
+                -Reservation $reservation `
+                -DeleteFiles (-not $reservationSucceeded)
         }
 
         return [pscustomobject]@{
@@ -1278,9 +1470,10 @@ function Save-TranscriptFromYoutube {
             Select-Object -First 1
 
         if ($exitCode -ne 0 -and -not $subtitleFile) {
-            $message = ($downloadOutput -join "`n").Trim()
+            $fullMessage = ([string]$downloadOutput).Trim()
+            $message = Get-BoundedTranscriptDiagnostic -Text $fullMessage
 
-            if ($message -match "HTTP Error 429|Too Many Requests") {
+            if ($fullMessage -match "HTTP Error 429|Too Many Requests|rate.?limit") {
                 throw "YouTube temporarily rate-limited subtitle downloads. Wait a little and try again."
             }
 
@@ -1300,18 +1493,33 @@ function Save-TranscriptFromYoutube {
             $artifactSuffixes += $subtitleFile.Extension
         }
 
-        $outputStemPath = Get-UniqueTranscriptOutputStem `
+        $reservation = New-TranscriptOutputReservation `
             -OutputDir $OutputDir `
             -Stem $outputStemName `
             -ArtifactSuffixes $artifactSuffixes
-        $txtPath = "$outputStemPath.txt"
-        $text = Convert-SubtitleFileToTranscriptText -Path $subtitleFile.FullName
-        Set-Content -LiteralPath $txtPath -Value $text -Encoding utf8
+        $reservationSucceeded = $false
+        try {
+            $txtPath = "$($reservation.StemPath).txt"
+            $text = Convert-SubtitleFileToTranscriptText -Path $subtitleFile.FullName
+            Write-TranscriptReservationText `
+                -Reservation $reservation `
+                -Suffix ".txt" `
+                -Text ($text + [System.Environment]::NewLine)
 
-        $subtitlePath = $null
-        if ($KeepSubtitles) {
-            $subtitlePath = "$outputStemPath$($subtitleFile.Extension)"
-            Copy-Item -LiteralPath $subtitleFile.FullName -Destination $subtitlePath
+            $subtitlePath = $null
+            if ($KeepSubtitles) {
+                $subtitlePath = "$($reservation.StemPath)$($subtitleFile.Extension)"
+                Copy-TranscriptFileToReservation `
+                    -Path $subtitleFile.FullName `
+                    -Reservation $reservation `
+                    -Suffix $subtitleFile.Extension
+            }
+            $reservationSucceeded = $true
+        }
+        finally {
+            Close-TranscriptOutputReservation `
+                -Reservation $reservation `
+                -DeleteFiles (-not $reservationSucceeded)
         }
 
         if ($OnStatus) { & $OnStatus "Done" }

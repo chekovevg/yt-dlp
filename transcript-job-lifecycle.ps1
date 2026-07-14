@@ -464,39 +464,15 @@ function Request-TranscriptBackgroundJobStop {
 
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $wasTerminal = Test-TranscriptJobTerminal -Job $Job
-    $group = $ProcessGroup
-    $identity = $WorkerIdentity
-    $terminationError = $null
-    $terminationSucceeded = $false
-
-    if (-not $wasTerminal) {
-        if ($group -and $stopwatch.ElapsedMilliseconds -lt $UiDeadlineMilliseconds) {
-            try {
-                $group.Terminate()
-                $terminationSucceeded = $true
-            }
-            catch {
-                $terminationError = $_
-            }
-        }
-
-        if (-not $terminationSucceeded -and -not $terminationError -and
-            $stopwatch.ElapsedMilliseconds -ge $UiDeadlineMilliseconds) {
-            $terminationError = New-Object System.TimeoutException(
-                "Transcript UI cleanup exceeded its deadline before termination could be requested."
-            )
-        }
-    }
-
     $stopwatch.Stop()
     return [pscustomobject]@{
         Job = $Job
-        ProcessGroup = $group
-        WorkerIdentity = $identity
+        ProcessGroup = $ProcessGroup
+        WorkerIdentity = $WorkerIdentity
         WorkerIdentityPath = $WorkerIdentityPath
         WasTerminal = $wasTerminal
-        UiTerminationSucceeded = $terminationSucceeded
-        UiTerminationError = $terminationError
+        UiTerminationSucceeded = $false
+        UiTerminationError = $null
         UiElapsedMilliseconds = $stopwatch.ElapsedMilliseconds
     }
 }

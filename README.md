@@ -64,7 +64,7 @@ The default command downloads subtitles into an isolated temporary folder, conve
 
 ## File Safety
 
-The tool does not delete or overwrite existing `.txt`, `.vtt`, or `.srt` files. If a planned output name already exists, the complete set of new files uses the next available shared suffix such as `-2` or `-3`. This keeps a transcript, its review file, and its saved subtitle coordinated while preserving the existing files byte-for-byte.
+The tool does not delete or overwrite existing `.txt`, `.vtt`, or `.srt` files. It atomically claims the complete set of final output files, so simultaneous desktop and command-line saves use distinct shared suffixes such as `-2` and `-3`. This keeps a transcript, its review file, and its saved subtitle coordinated while preserving existing files byte-for-byte. If conversion fails, only that run's newly claimed empty or partial outputs are removed.
 
 ## Create A Desktop Shortcut
 
@@ -182,4 +182,4 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-transcript-t
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-download-subs-tests.ps1
 ```
 
-The checks cover desktop launch/responding behavior, bounded background-job shutdown, the shared transcript core, the command-line interface, file-collision safety, and temporary-directory cleanup.
+The checks cover desktop launch/responding behavior, non-blocking background-job shutdown, the shared transcript core, the command-line interface, two-process atomic file-collision safety, and temporary-directory cleanup.

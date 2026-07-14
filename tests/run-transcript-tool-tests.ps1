@@ -20,6 +20,20 @@ using System.Text;
 public class Program {
     public static int Main(string[] args) {
         var url = args.Length == 0 ? "" : args[args.Length - 1];
+        if (args.Contains("--echo-args")) {
+            foreach (var argument in args.SkipWhile(value => value != "--echo-args").Skip(1)) {
+                Console.WriteLine(argument.Length + ":" + Convert.ToBase64String(Encoding.UTF8.GetBytes(argument)));
+            }
+            return 0;
+        }
+        if (url.Contains("metadata-rate-limit")) {
+            Console.Error.WriteLine("ERROR: HTTP Error 429: Too Many Requests " + new string('r', 3000));
+            return 9;
+        }
+        if (url.Contains("metadata-long")) {
+            Console.Error.WriteLine("ERROR: " + new string('m', 3000) + " TAIL-METADATA-DIAGNOSTIC");
+            return 9;
+        }
         if (url.Contains("cli-failure")) {
             Console.Error.WriteLine("ERROR: " + new string('x', 3000) + " TAIL-CLI-DIAGNOSTIC");
             return 7;
@@ -32,6 +46,10 @@ public class Program {
             Console.Error.WriteLine("WARNING: harmless warning");
             Console.WriteLine("{\"id\":\"abc123\",\"title\":\"Test\",\"subtitles\":{},\"automatic_captions\":{\"ru\":[{\"ext\":\"vtt\"}]}}");
             return 0;
+        }
+        if (url.Contains("download-long")) {
+            Console.Error.WriteLine("ERROR: " + new string('d', 3000) + " TAIL-DOWNLOAD-DIAGNOSTIC");
+            return 6;
         }
         var outputIndex = Array.IndexOf(args, "-o");
         var template = args[outputIndex + 1];
@@ -225,6 +243,22 @@ $tests = @(
         }
     },
     @{
+        Name = "Auto skips a manual language whose format list is empty"
+        Run = {
+            $emptyManualAndCaptions = [pscustomobject]@{
+                subtitles = [pscustomobject]@{
+                    fr = @()
+                }
+                automatic_captions = [pscustomobject]@{
+                    ja = @([pscustomobject]@{ ext = "VTT" })
+                }
+            }
+
+            $choice = Resolve-TranscriptSubtitleChoice -Info $emptyManualAndCaptions -Preference "auto"
+            Assert-True ($choice.Tag -eq "ja") "Expected Japanese VTT captions instead of empty French formats, got $($choice.Tag)."
+        }
+    },
+    @{
         Name = "Selected unavailable supported language returns available language list"
         Run = {
             try {
@@ -335,6 +369,142 @@ $tests = @(
                 Assert-True ($saved.TextPath -eq (Join-Path $outputDir "Second.en-2.txt")) "Expected -2 transcript path, got $($saved.TextPath)"
                 Assert-True (Test-Path -LiteralPath $saved.TextPath) "Expected collision-safe -2 transcript."
                 Assert-BytesEqual -Expected $oldTextBytes -Actual ([System.IO.File]::ReadAllBytes($oldText)) -Message "Existing unsuffixed transcript changed."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "Concurrent subtitle-file saves atomically claim distinct stems"
+        Run = {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-concurrent-core-tests-" + [System.Guid]::NewGuid().ToString("N"))
+            $outputDir = Join-Path $dir "output"
+            $runnerPath = Join-Path $dir "save-runner.ps1"
+            New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+            $processes = @()
+            $gate = $null
+
+            try {
+                $sourceDirs = @((Join-Path $dir "one"), (Join-Path $dir "two"))
+                $markers = @("FIRST-CONCURRENT-CONTENT", "SECOND-CONCURRENT-CONTENT")
+                $sourcePaths = @()
+                for ($sourceIndex = 0; $sourceIndex -lt 2; $sourceIndex++) {
+                    New-Item -ItemType Directory -Path $sourceDirs[$sourceIndex] -Force | Out-Null
+                    $sourcePath = Join-Path $sourceDirs[$sourceIndex] "Concurrent.en.vtt"
+                    $builder = New-Object System.Text.StringBuilder
+                    [void]$builder.Append("WEBVTT`r`n`r`n00:00:00.000 --> 00:30:00.000`r`n")
+                    for ($lineIndex = 0; $lineIndex -lt 30000; $lineIndex++) {
+                        [void]$builder.Append($markers[$sourceIndex]).Append(" ").Append($lineIndex).Append(".`r`n")
+                    }
+                    [System.IO.File]::WriteAllText($sourcePath, $builder.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+                    $sourcePaths += $sourcePath
+                }
+
+                $oldPath = Join-Path $outputDir "Concurrent.en.txt"
+                $oldBytes = [byte[]]@(81, 82, 83, 84, 85)
+                [System.IO.File]::WriteAllBytes($oldPath, $oldBytes)
+                Set-Content -LiteralPath $runnerPath -Encoding utf8 -Value @(
+                    'param([string]$Module64,[string]$Source64,[string]$Output64,[string]$Result64,[string]$GateName)',
+                    '$ErrorActionPreference = "Stop"',
+                    '$decode = { param($value) [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) }',
+                    '$modulePath = & $decode $Module64',
+                    '$sourcePath = & $decode $Source64',
+                    '$outputDir = & $decode $Output64',
+                    '$resultPath = & $decode $Result64',
+                    '$gate = [System.Threading.EventWaitHandle]::OpenExisting($GateName)',
+                    'try { [void]$gate.WaitOne() } finally { $gate.Dispose() }',
+                    'Import-Module $modulePath -Force',
+                    '$saved = Save-TranscriptFromSubtitleFile -Path $sourcePath -OutputDir $outputDir -CleanTranscript $false',
+                    '$saved | ConvertTo-Json -Compress | Set-Content -LiteralPath $resultPath -Encoding utf8'
+                )
+
+                $gateName = "Local\TranscriptAtomicCore-" + [Guid]::NewGuid().ToString("N")
+                $gate = New-Object System.Threading.EventWaitHandle -ArgumentList @($false, [System.Threading.EventResetMode]::ManualReset, $gateName)
+                $encode = {
+                    param($value)
+                    [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$value))
+                }
+                $resultPaths = @((Join-Path $dir "one.json"), (Join-Path $dir "two.json"))
+                for ($processIndex = 0; $processIndex -lt 2; $processIndex++) {
+                    $psi = New-Object System.Diagnostics.ProcessStartInfo
+                    $psi.FileName = "powershell.exe"
+                    $psi.Arguments = @(
+                        '-NoProfile',
+                        '-ExecutionPolicy', 'Bypass',
+                        '-File', ('"' + $runnerPath + '"'),
+                        '-Module64', (& $encode $modulePath),
+                        '-Source64', (& $encode $sourcePaths[$processIndex]),
+                        '-Output64', (& $encode $outputDir),
+                        '-Result64', (& $encode $resultPaths[$processIndex]),
+                        '-GateName', $gateName
+                    ) -join ' '
+                    $psi.UseShellExecute = $false
+                    $psi.CreateNoWindow = $true
+                    $psi.RedirectStandardOutput = $true
+                    $psi.RedirectStandardError = $true
+                    $processes += [System.Diagnostics.Process]::Start($psi)
+                }
+
+                [void]$gate.Set()
+                $results = @()
+                for ($processIndex = 0; $processIndex -lt $processes.Count; $processIndex++) {
+                    $process = $processes[$processIndex]
+                    Assert-True ($process.WaitForExit(60000)) "Concurrent core process $processIndex timed out."
+                    $stdout = $process.StandardOutput.ReadToEnd()
+                    $stderr = $process.StandardError.ReadToEnd()
+                    Assert-True ($process.ExitCode -eq 0) "Concurrent core process $processIndex failed: $stdout $stderr"
+                    $results += (Get-Content -LiteralPath $resultPaths[$processIndex] -Raw -Encoding utf8 | ConvertFrom-Json)
+                }
+
+                $claimedPaths = @($results | ForEach-Object { [string]$_.TextPath } | Sort-Object)
+                Assert-True (($claimedPaths | Select-Object -Unique).Count -eq 2) "Concurrent core saves claimed the same path: $($claimedPaths -join ', ')"
+                Assert-True ($claimedPaths[0] -eq (Join-Path $outputDir "Concurrent.en-2.txt")) "Expected first atomic suffix -2, got $($claimedPaths[0])."
+                Assert-True ($claimedPaths[1] -eq (Join-Path $outputDir "Concurrent.en-3.txt")) "Expected second atomic suffix -3, got $($claimedPaths[1])."
+                for ($resultIndex = 0; $resultIndex -lt 2; $resultIndex++) {
+                    $content = Get-Content -LiteralPath $results[$resultIndex].TextPath -Raw -Encoding utf8
+                    Assert-True ($content -match $markers[$resultIndex]) "Concurrent output lost its invocation's content: $($results[$resultIndex].TextPath)"
+                }
+                Assert-BytesEqual -Expected $oldBytes -Actual ([System.IO.File]::ReadAllBytes($oldPath)) -Message "Concurrent saves changed the pre-existing transcript."
+                $outputFiles = @(Get-ChildItem -LiteralPath $outputDir -File)
+                Assert-True ($outputFiles.Count -eq 3) "Concurrent core left unexpected reservation files: $($outputFiles.Name -join ', ')"
+                Assert-True (@($outputFiles | Where-Object Length -eq 0).Count -eq 0) "Concurrent core left zero-byte reservations."
+            }
+            finally {
+                if ($gate) { $gate.Dispose() }
+                foreach ($process in $processes) {
+                    if ($process -and -not $process.HasExited) { $process.Kill() }
+                    if ($process) { $process.Dispose() }
+                }
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
+        Name = "Failed subtitle conversion releases only its own reservations"
+        Run = {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-reservation-failure-tests-" + [System.Guid]::NewGuid().ToString("N"))
+            $outputDir = Join-Path $dir "output"
+            New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+            try {
+                $subtitle = Join-Path $dir "Broken.en.vtt"
+                Set-Content -LiteralPath $subtitle -Encoding utf8 -Value @("WEBVTT", "", "00:00:00.000 --> 00:00:01.000", "")
+                $oldPath = Join-Path $outputDir "Broken.en.clean.txt"
+                $oldBytes = [byte[]]@(91, 92, 93, 94)
+                [System.IO.File]::WriteAllBytes($oldPath, $oldBytes)
+
+                try {
+                    Save-TranscriptFromSubtitleFile -Path $subtitle -OutputDir $outputDir -CleanTranscript $true | Out-Null
+                    throw "Expected failed subtitle conversion."
+                }
+                catch {
+                    Assert-True ($_.Exception.Message -eq "Subtitle file did not contain readable transcript text.") "Unexpected conversion error: $($_.Exception.Message)"
+                }
+
+                Assert-BytesEqual -Expected $oldBytes -Actual ([System.IO.File]::ReadAllBytes($oldPath)) -Message "Failed conversion changed the pre-existing transcript."
+                Assert-True (-not (Test-Path -LiteralPath (Join-Path $outputDir "Broken.en-2.clean.txt"))) "Failed conversion left a zero-byte clean-text reservation."
+                Assert-True (-not (Test-Path -LiteralPath (Join-Path $outputDir "Broken.en-2.review.txt"))) "Failed conversion left a zero-byte review reservation."
+                Assert-True (@(Get-ChildItem -LiteralPath $outputDir -File).Count -eq 1) "Failed conversion left unexpected output artifacts."
             }
             finally {
                 Remove-Item -LiteralPath $dir -Recurse -Force
@@ -495,6 +665,72 @@ $tests = @(
         }
     },
     @{
+        Name = "VTT and SRT preserve header-like tokens inside cue payloads"
+        Run = {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-header-payload-tests-" + [System.Guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+            try {
+                $vtt = Join-Path $dir "payload.vtt"
+                Set-Content -LiteralPath $vtt -Encoding utf8 -Value @(
+                    "WEBVTT",
+                    "Kind: captions",
+                    "Language: en",
+                    "",
+                    "00:00:00.000 --> 00:00:01.000",
+                    "WEBVTT",
+                    "Kind: this is spoken",
+                    "Language: this is also spoken"
+                )
+                $srt = Join-Path $dir "payload.srt"
+                Set-Content -LiteralPath $srt -Encoding utf8 -Value @(
+                    "1",
+                    "00:00:00,000 --> 00:00:01,000",
+                    "WEBVTT",
+                    "Kind: SRT speech",
+                    "Language: SRT speech"
+                )
+
+                $vttText = Convert-SubtitleFileToTranscriptText -Path $vtt
+                $srtText = Convert-SubtitleFileToTranscriptText -Path $srt
+                Assert-True ($vttText -eq "WEBVTT Kind: this is spoken Language: this is also spoken") "VTT cue payload header tokens were discarded: $vttText"
+                Assert-True ($srtText -eq "WEBVTT Kind: SRT speech Language: SRT speech") "SRT cue payload header tokens were discarded: $srtText"
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "Native invocation round-trips Windows argument edge cases"
+        Run = {
+            $arguments = @(
+                "plain",
+                "with space",
+                'say "hello"',
+                "",
+                "C:\folder with space\",
+                "C:\plain\",
+                'slashes\\before"quote',
+                "trailing slash with space\\"
+            )
+            $result = Invoke-TranscriptProcess -FilePath $fakeYtDlpPath -ArgumentList (@("--echo-args") + $arguments)
+            Assert-True ($result.ExitCode -eq 0) "Argument echo process failed: $($result.Output)"
+            $actual = @(
+                $result.StdOut -split "`r?`n" |
+                    Where-Object { $_ -match '^\d+:' } |
+                    ForEach-Object {
+                        $parts = $_ -split ':', 2
+                        [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[1]))
+                    }
+            )
+            Assert-True ($actual.Count -eq $arguments.Count) "Native argv count changed from $($arguments.Count) to $($actual.Count)."
+            for ($index = 0; $index -lt $arguments.Count; $index++) {
+                Assert-True ([string]$actual[$index] -ceq [string]$arguments[$index]) "Native argv[$index] changed. Expected '$($arguments[$index])', got '$($actual[$index])'."
+            }
+        }
+    },
+    @{
         Name = "CLI core returns one public result when attempt callback writes output"
         Run = {
             $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-cli-result-tests-" + [System.Guid]::NewGuid().ToString("N"))
@@ -619,6 +855,54 @@ $tests = @(
             }
             catch {
                 Assert-True ($_.Exception.Message -eq "This video is unavailable without login or cannot be accessed by yt-dlp.") "Unexpected error: $($_.Exception.Message)"
+            }
+        }
+    },
+    @{
+        Name = "Metadata diagnostics are bounded and rate limits map before network errors"
+        Run = {
+            try {
+                Invoke-YtDlpJson -YtDlpPath $fakeYtDlpPath -Url "https://youtube.com/watch?v=metadata-long" | Out-Null
+                throw "Expected bounded metadata error."
+            }
+            catch {
+                $message = $_.Exception.Message
+                Assert-True ($message -match "TAIL-METADATA-DIAGNOSTIC") "Expected metadata diagnostic tail: $message"
+                Assert-True ($message.Length -le 2100) "Metadata exception was not bounded: $($message.Length) characters."
+            }
+
+            try {
+                Invoke-YtDlpJson -YtDlpPath $fakeYtDlpPath -Url "https://youtube.com/watch?v=metadata-rate-limit" | Out-Null
+                throw "Expected rate-limit error."
+            }
+            catch {
+                Assert-True ($_.Exception.Message -eq "YouTube temporarily rate-limited requests. Wait a little and try again.") "Rate limit was hidden by generic network mapping: $($_.Exception.Message)"
+            }
+        }
+    },
+    @{
+        Name = "GUI core download diagnostics are bounded"
+        Run = {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-download-diagnostic-tests-" + [System.Guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            try {
+                try {
+                    Save-TranscriptFromYoutube `
+                        -Url "https://youtube.com/watch?v=download-long" `
+                        -OutputDir $dir `
+                        -Language "ru" `
+                        -KeepSubtitles $false `
+                        -YtDlpPath $fakeYtDlpPath | Out-Null
+                    throw "Expected bounded download error."
+                }
+                catch {
+                    $message = $_.Exception.Message
+                    Assert-True ($message -match "TAIL-DOWNLOAD-DIAGNOSTIC") "Expected download diagnostic tail: $message"
+                    Assert-True ($message.Length -le 2100) "Download exception was not bounded: $($message.Length) characters."
+                }
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
             }
         }
     }

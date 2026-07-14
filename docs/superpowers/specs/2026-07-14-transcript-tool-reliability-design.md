@@ -20,13 +20,13 @@ The CLI will preserve its public switches, but download operations will use a un
 
 For online CLI runs, normal conversion writes the transcript to `-OutputDir`. `-KeepSubs` additionally copies the selected subtitle into `-OutputDir`. `-NoClean` skips text conversion and copies every subtitle produced by the current run into `-OutputDir`; it never exposes or reuses the temporary workspace.
 
-The GUI keeps its current controls and wording. The save operation will run outside the WinForms UI thread, return status updates through the form thread, disable duplicate submissions while active, and restore the controls after success or failure.
+The GUI keeps its current controls and wording. The save operation runs outside the WinForms UI thread, returns status updates through the form thread, disables duplicate submissions while active, and restores the controls after success or failure. Closing the form only closes the worker start gate and captures a cleanup ticket; process-group termination, process discovery, resource disposal, and job removal run after the WinForms message loop exits.
 
 ## Native Process Execution
 
 A single internal helper will execute `yt-dlp` with stdout and stderr captured separately. stderr output will not become a terminating PowerShell error merely because `$ErrorActionPreference` is `Stop`. The helper returns exit code, stdout, and stderr; callers classify failures only after the process has exited.
 
-Successful commands may emit warnings without failing. Failed commands will retain the existing user-facing categories for invalid links, unavailable/private videos, network problems, rate limiting, and missing subtitles. Unexpected failures will include a bounded diagnostic message from `yt-dlp`.
+Successful commands may emit warnings without failing. Failed commands retain the existing user-facing categories for invalid links, unavailable/private videos, network problems, rate limiting, and missing subtitles. Rate limiting is classified before generic HTTP/network failures. Unexpected metadata and subtitle-download failures include a diagnostic tail bounded to approximately 2,000 characters.
 
 ## Subtitle Selection
 
@@ -36,7 +36,7 @@ Explicit `ru`, `en`, and `de` preferences will match exact tags and regional var
 
 ## Subtitle Parsing
 
-The converter will parse VTT/SRT structure with state rather than filtering every line through one broad regular expression. It will:
+The converter parses VTT/SRT structure with state rather than filtering every line through one broad regular expression. `WEBVTT`, `Kind:`, and `Language:` are recognized as technical headers only during the document-header phase, never after cue parsing begins. It will:
 
 - skip complete `NOTE`, `STYLE`, and `REGION` blocks;
 - skip cue identifiers and timestamp lines;
@@ -50,7 +50,7 @@ The converter will parse VTT/SRT structure with state rather than filtering ever
 
 Every online download uses a GUID-named temporary directory and an explicit output template. Cleanup is limited to that directory. Existing `.vtt`, `.srt`, and `.txt` files outside it are never deleted or overwritten.
 
-Before writing output, the shared core checks every artifact planned for the operation. It uses the unsuffixed stem only when all targets are free; otherwise it selects the next fully free numeric stem (`-2`, `-3`, and so on). A transcript, its review file, and its copied subtitle always share that selected stem. The same collision-safe rule applies to `-CleanOnly`, `-NoClean`, normal CLI downloads, and GUI-core saves.
+Before converting or copying output, the shared core atomically creates every final target for one candidate stem with `FileMode.CreateNew`. If any target already exists, it closes and removes only the targets created by that invocation and retries the next numeric stem (`-2`, `-3`, and so on). Text and subtitle bytes are written through those reserved destination streams, so concurrent GUI and CLI processes cannot claim or overwrite the same path. A transcript, its review file, and its copied subtitle always share the selected stem. Failed operations remove their own zero-byte or partial reservations without touching pre-existing files. The same rule applies to `-CleanOnly`, `-NoClean`, normal CLI downloads, and GUI-core saves.
 
 ## Interfaces
 
@@ -70,8 +70,9 @@ The module regression suite will cover:
 - regional language tags;
 - exclusion of `live_chat`;
 - structured VTT blocks, numeric captions, duplicate captions, and empty output;
+- VTT/SRT cue text beginning exactly with `WEBVTT`, `Kind:`, or `Language:`;
 - end-to-end saving with a fake `yt-dlp` executable;
-- collision-safe `-2`/`-3` output naming across transcript, review, and subtitle artifacts;
+- atomic two-process `-2`/`-3` output claims across transcript, review, and subtitle artifacts;
 - exact public result shapes, callback-output suppression, bounded diagnostics, and temporary workspace cleanup;
 - restoration of whitespace cleanup immediately inside brackets.
 

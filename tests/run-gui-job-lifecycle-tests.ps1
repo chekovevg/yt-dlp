@@ -174,6 +174,24 @@ function New-StartGate {
     )
 }
 
+function Start-HiddenLifecycleNativeProcess {
+    param([Parameter(Mandatory = $true)][string]$FilePath)
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        $process.Dispose()
+        throw "Could not start hidden lifecycle native fixture."
+    }
+
+    return $process
+}
+
 function Start-LifecycleFixtureJob {
     param(
         [Parameter(Mandatory = $true)][string]$NativeExe,
@@ -227,16 +245,32 @@ function Start-LifecycleFixtureJob {
         }
 
         [System.IO.File]::WriteAllText($postGateMarkerPath, "started")
-        $nativeProcess = Start-Process -FilePath $nativeExe -PassThru
-        $nativeIdentity = [pscustomobject]@{
-            Id = $nativeProcess.Id
-            CreationFileTimeUtc = $nativeProcess.StartTime.ToUniversalTime().ToFileTimeUtc()
+        $nativeStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $nativeStartInfo.FileName = $nativeExe
+        $nativeStartInfo.UseShellExecute = $false
+        $nativeStartInfo.CreateNoWindow = $true
+        $nativeStartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+        $nativeProcess = New-Object System.Diagnostics.Process
+        $nativeProcess.StartInfo = $nativeStartInfo
+        try {
+            if (-not $nativeProcess.Start()) {
+                throw "Could not start hidden lifecycle native fixture."
+            }
+            $nativeIdentity = [pscustomobject]@{
+                Id = $nativeProcess.Id
+                CreationFileTimeUtc = $nativeProcess.StartTime.ToUniversalTime().ToFileTimeUtc()
+                CreateNoWindow = $nativeStartInfo.CreateNoWindow
+                UseShellExecute = $nativeStartInfo.UseShellExecute
+            }
+            [pscustomobject]@{
+                Kind = "Native"
+                Value = $nativeIdentity
+            }
+            $nativeProcess.WaitForExit()
         }
-        [pscustomobject]@{
-            Kind = "Native"
-            Value = $nativeIdentity
+        finally {
+            $nativeProcess.Dispose()
         }
-        $nativeProcess.WaitForExit()
     }
 }
 
@@ -425,6 +459,8 @@ $tests = @(
 
                 $nativeMessages = @(Receive-LifecycleMessages -Job $job -RequiredKinds @("Native"))
                 $nativeIdentity = ($nativeMessages | Where-Object Kind -eq "Native" | Select-Object -First 1).Value
+                Assert-True ([bool]$nativeIdentity.CreateNoWindow) "Lifecycle native fixture was not launched with CreateNoWindow."
+                Assert-True (-not [bool]$nativeIdentity.UseShellExecute) "Lifecycle native fixture unexpectedly used the shell."
                 $nativeHandle = New-LifecycleTestProcessHandle -Identity $nativeIdentity
                 Assert-True ($job.State -eq "Running") "Expected active fixture job."
 
@@ -456,6 +492,93 @@ $tests = @(
                     -NativeHandle $nativeHandle `
                     -WorkerIdentity $workerIdentity `
                     -NativeIdentity $nativeIdentity
+                Remove-Item -LiteralPath $identityPath -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $postGateMarkerPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
+        Name = "UI stop request never calls a slow process-group terminator"
+        Run = {
+            $job = $null
+            $realProcessGroup = $null
+            $slowGroup = $null
+            $workerIdentity = $null
+            $nativeIdentity = $null
+            $workerHandle = $null
+            $nativeHandle = $null
+            $identityPath = Join-Path $tempRoot ("slow-terminate-" + [Guid]::NewGuid().ToString("N") + ".json")
+            $postGateMarkerPath = Join-Path $tempRoot ("slow-terminate-post-gate-" + [Guid]::NewGuid().ToString("N"))
+            $gateName = "Local\TranscriptLifecycle-" + [Guid]::NewGuid().ToString("N")
+            $startGate = New-StartGate -Name $gateName
+
+            try {
+                $job = Start-LifecycleFixtureJob `
+                    -NativeExe $nativeExe `
+                    -WorkerIdentityPath $identityPath `
+                    -StartGateName $gateName `
+                    -PostGateMarkerPath $postGateMarkerPath
+                $workerMessages = @(Receive-LifecycleMessages -Job $job -RequiredKinds @("Worker"))
+                $workerIdentity = ($workerMessages | Where-Object Kind -eq "Worker" | Select-Object -First 1).Value
+                $workerHandle = New-LifecycleTestProcessHandle -Identity $workerIdentity
+                $realProcessGroup = New-TranscriptProcessGroup -WorkerIdentity $workerIdentity
+                $slowGroup = [pscustomobject]@{
+                    Inner = $realProcessGroup
+                    TerminateCalls = 0
+                    DisposeCalls = 0
+                }
+                $slowGroup | Add-Member ScriptMethod Terminate {
+                    $this.TerminateCalls++
+                    Start-Sleep -Milliseconds 2300
+                    $this.Inner.Terminate()
+                }
+                $slowGroup | Add-Member ScriptMethod Dispose {
+                    $this.DisposeCalls++
+                    $this.Inner.Dispose()
+                }
+                [void]$startGate.Set()
+                $startGate.Dispose()
+                $startGate = $null
+                $nativeMessages = @(Receive-LifecycleMessages -Job $job -RequiredKinds @("Native"))
+                $nativeIdentity = ($nativeMessages | Where-Object Kind -eq "Native" | Select-Object -First 1).Value
+                $nativeHandle = New-LifecycleTestProcessHandle -Identity $nativeIdentity
+
+                $requestStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                $ticket = Request-TranscriptBackgroundJobStop `
+                    -Job $job `
+                    -ProcessGroup $slowGroup `
+                    -WorkerIdentity $workerIdentity `
+                    -WorkerIdentityPath $identityPath `
+                    -UiDeadlineMilliseconds 100
+                $requestStopwatch.Stop()
+
+                Assert-True ($requestStopwatch.ElapsedMilliseconds -lt 200) "UI request blocked for $($requestStopwatch.ElapsedMilliseconds) ms on slow Terminate()."
+                Assert-True ($slowGroup.TerminateCalls -eq 0) "UI request synchronously called Terminate()."
+
+                Complete-TranscriptBackgroundJobCleanup -Ticket $ticket
+                Assert-True ($slowGroup.TerminateCalls -eq 1) "Deferred cleanup did not own the single Terminate() call."
+                Assert-True ($slowGroup.DisposeCalls -eq 1) "Deferred cleanup did not dispose the process group."
+                Assert-ProcessHandleExited -ProcessHandle $workerHandle -Description "Slow-terminate worker"
+                Assert-ProcessHandleExited -ProcessHandle $nativeHandle -Description "Slow-terminate native"
+                Assert-True (-not (Get-Job -Id $job.Id -ErrorAction SilentlyContinue)) "Slow-terminate cleanup did not remove the job."
+
+                $job = $null
+                $realProcessGroup = $null
+                $slowGroup = $null
+                Write-Host "PASS $($requestStopwatch.ElapsedMilliseconds) ms - slow termination deferred"
+            }
+            finally {
+                if ($startGate) { $startGate.Dispose() }
+                Stop-LifecycleFixture `
+                    -Job $job `
+                    -ProcessGroup $slowGroup `
+                    -WorkerHandle $workerHandle `
+                    -NativeHandle $nativeHandle `
+                    -WorkerIdentity $workerIdentity `
+                    -NativeIdentity $nativeIdentity
+                if ($realProcessGroup -and -not $slowGroup) {
+                    try { $realProcessGroup.Dispose() } catch {}
+                }
                 Remove-Item -LiteralPath $identityPath -Force -ErrorAction SilentlyContinue
                 Remove-Item -LiteralPath $postGateMarkerPath -Force -ErrorAction SilentlyContinue
             }
@@ -554,7 +677,9 @@ $tests = @(
                 $job = Start-Job { "done" }
                 Wait-Job -Job $job -Timeout 5 | Out-Null
                 Assert-True ($job.State -eq "Completed") "Expected terminal fixture job."
-                $unrelatedProcess = Start-Process -FilePath $nativeExe -PassThru
+                $unrelatedProcess = Start-HiddenLifecycleNativeProcess -FilePath $nativeExe
+                Assert-True $unrelatedProcess.StartInfo.CreateNoWindow "PID-reuse fixture was not launched with CreateNoWindow."
+                Assert-True (-not $unrelatedProcess.StartInfo.UseShellExecute) "PID-reuse fixture unexpectedly used the shell."
                 $unrelatedIdentity = [pscustomobject]@{
                     Id = $unrelatedProcess.Id
                     CreationFileTimeUtc = $unrelatedProcess.StartTime.ToUniversalTime().ToFileTimeUtc()
@@ -645,9 +770,11 @@ $tests = @(
                     -UiDeadlineMilliseconds 1500
                 $stopwatch.Stop()
 
-                Assert-True ($stopwatch.ElapsedMilliseconds -le 2000) "Failed UI cleanup path took $($stopwatch.ElapsedMilliseconds) ms."
-                Assert-True ([bool]$ticket.UiTerminationError) "Expected the forced UI termination error on the cleanup ticket."
+                Assert-True ($stopwatch.ElapsedMilliseconds -lt 200) "Failed UI cleanup request took $($stopwatch.ElapsedMilliseconds) ms."
+                Assert-True ($failingGroup.TerminateCalls -eq 0) "UI cleanup request called the failing terminator."
+                Assert-True (-not $ticket.UiTerminationError) "UI cleanup request reported a termination it did not attempt."
                 Complete-TranscriptBackgroundJobCleanup -Ticket $ticket
+                Assert-True ($failingGroup.TerminateCalls -eq 1) "Deferred cleanup did not call the failing terminator exactly once."
                 Assert-ProcessHandleExited -ProcessHandle $workerHandle -Description "Fallback worker"
                 Assert-ProcessHandleExited -ProcessHandle $nativeHandle -Description "Fallback native"
                 Assert-True (-not (Get-Job -Id $job.Id -ErrorAction SilentlyContinue)) "Fallback deferred cleanup did not remove the job."
