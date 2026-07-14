@@ -128,7 +128,7 @@ $tests = @(
         Run = {
             $liveChatAndCaptions = [pscustomobject]@{
                 subtitles = [pscustomobject]@{
-                    live_chat = @([pscustomobject]@{ ext = "json" })
+                    live_chat = @([pscustomobject]@{ ext = "vtt" })
                 }
                 automatic_captions = [pscustomobject]@{
                     ja = @([pscustomobject]@{ ext = "vtt" })
@@ -137,6 +137,22 @@ $tests = @(
 
             $choice = Resolve-TranscriptSubtitleChoice -Info $liveChatAndCaptions -Preference "auto"
             Assert-True ($choice.Tag -eq "ja") "Expected Japanese captions instead of live chat."
+        }
+    },
+    @{
+        Name = "Auto skips unusable manual formats in favor of Japanese captions"
+        Run = {
+            $unusableManualAndCaptions = [pscustomobject]@{
+                subtitles = [pscustomobject]@{
+                    fr = @([pscustomobject]@{ ext = "json" })
+                }
+                automatic_captions = [pscustomobject]@{
+                    ja = @([pscustomobject]@{ ext = "vtt" })
+                }
+            }
+
+            $choice = Resolve-TranscriptSubtitleChoice -Info $unusableManualAndCaptions -Preference "auto"
+            Assert-True ($choice.Tag -eq "ja") "Expected Japanese captions instead of an unusable manual format."
         }
     },
     @{
