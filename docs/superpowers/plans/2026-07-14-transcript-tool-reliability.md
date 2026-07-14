@@ -258,7 +258,7 @@ Expected: case 1 loses its source, case 2 deletes unrelated files or converts th
 
 - [ ] **Step 3: Add shared subtitle-file saving**
 
-Move the opt-in transcript normalization helpers from `download-subs.ps1` into `transcript-tool.psm1`. Implement `Save-TranscriptFromSubtitleFile` so it converts through the shared structural parser, writes `.txt` or `.clean.txt` in `OutputDir`, writes `.review.txt` only for transcript mode, and never deletes `Path` or overwrites an output. Use one shared reservation helper that opens every final target for a stem with `FileMode.CreateNew`. On collision, close and delete only this invocation's partial reservations before retrying the next numeric suffix. Write text and review bytes through the reserved streams so coordinated artifacts receive the same atomic numeric suffix across concurrent processes.
+Move the opt-in transcript normalization helpers from `download-subs.ps1` into `transcript-tool.psm1`. Implement `Save-TranscriptFromSubtitleFile` so it converts through the shared structural parser, writes `.txt` or `.clean.txt` in `OutputDir`, writes `.review.txt` only for transcript mode, and never deletes `Path` or overwrites an output. Acquire each candidate stem with a `CreateNew`/`DeleteOnClose` interprocess lock, write complete artifacts into an operation-GUID staging directory on the output volume, record stable file identities in a manifest, then publish with atomic no-replace renames and a final commit marker. Roll back interrupted publication only through identity-validated handles.
 
 - [ ] **Step 4: Add safe CLI online saving**
 
@@ -306,7 +306,7 @@ Expected: PASS. This establishes that the existing window launches before changi
 
 On click, save settings, disable buttons, and start a job that imports the module and calls `Save-TranscriptFromYoutube`. Emit objects shaped as `{ Kind = 'Status'; Value = <status> }` and `{ Kind = 'Result'; Value = <result> }`. Start the WinForms timer.
 
-On each timer tick, call `Receive-Job` without `-Keep`, map status objects through the existing localized status switch, store the result object, and when job state is complete or failed: stop the timer, show the result or the job's first error, remove the terminal job, re-enable controls, and enable Open Folder only after success. On form close, dispose the start gate and capture a cleanup ticket without calling process termination synchronously. After `Application.Run` returns, terminate/dispose the process group, perform any safe identity fallback, and remove the active job.
+On each timer tick, call `Receive-Job` without `-Keep`, map status objects through the existing localized status switch, store the result object, and when job state is complete or failed: stop the timer, show the result or the job's first error, remove the terminal job, re-enable controls, and enable Open Folder only after success. Before worker work begins, the GUI parent owns the operation GUID and exact staging/download paths. On form close, dispose the start gate and capture those values in a cleanup ticket without calling process termination synchronously. After `Application.Run` returns, terminate/dispose the process group, perform any safe identity fallback, remove the active job, roll back only identity-matching partial publication, and remove the validated operation workspaces.
 
 - [ ] **Step 4: Run GUI smoke and backend suites**
 

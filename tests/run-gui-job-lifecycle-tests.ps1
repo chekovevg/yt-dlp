@@ -274,6 +274,66 @@ function Start-LifecycleFixtureJob {
     }
 }
 
+function Start-CrashSafeSaveFixtureJob {
+    param(
+        [string]$ModulePath,
+        [string]$NativeExe,
+        [string]$SourcePath,
+        [string]$OutputDir,
+        [string]$OperationId,
+        [string]$WorkerIdentityPath,
+        [string]$StartGateName
+    )
+
+    Start-Job -ArgumentList @(
+        $ModulePath, $NativeExe, $SourcePath, $OutputDir, $OperationId,
+        $WorkerIdentityPath, $StartGateName
+    ) -ScriptBlock {
+        param($modulePath, $nativeExe, $sourcePath, $outputDir, $operationId,
+            $workerIdentityPath, $startGateName)
+        $ErrorActionPreference = "Stop"
+        $worker = [System.Diagnostics.Process]::GetCurrentProcess()
+        $identity = [pscustomobject]@{
+            Id = $PID
+            CreationFileTimeUtc = $worker.StartTime.ToUniversalTime().ToFileTimeUtc()
+        }
+        [System.IO.File]::WriteAllText($workerIdentityPath, ($identity | ConvertTo-Json -Compress))
+        $gate = [System.Threading.EventWaitHandle]::OpenExisting($startGateName)
+        try {
+            [pscustomobject]@{ Kind = "Worker"; Value = $identity }
+            [void]$gate.WaitOne()
+        }
+        finally { $gate.Dispose() }
+
+        Import-Module $modulePath -Force
+        $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("youtube-transcript-tool-" + $operationId)
+        New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $nativeExe
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+        $native = New-Object System.Diagnostics.Process
+        $native.StartInfo = $psi
+        if (-not $native.Start()) { throw "Could not start hidden cancellation fixture." }
+        [pscustomobject]@{
+            Kind = "Native"
+            Value = [pscustomobject]@{
+                Id = $native.Id
+                CreationFileTimeUtc = $native.StartTime.ToUniversalTime().ToFileTimeUtc()
+                CreateNoWindow = $psi.CreateNoWindow
+                UseShellExecute = $psi.UseShellExecute
+            }
+        }
+        Save-TranscriptFromSubtitleFile `
+            -Path $sourcePath `
+            -OutputDir $outputDir `
+            -CleanTranscript $true `
+            -OperationId $operationId | Out-Null
+        $native.WaitForExit()
+    }
+}
+
 function New-LifecycleTestProcessHandle {
     param([Parameter(Mandatory = $true)][object]$Identity)
 
@@ -581,6 +641,83 @@ $tests = @(
                 }
                 Remove-Item -LiteralPath $identityPath -Force -ErrorAction SilentlyContinue
                 Remove-Item -LiteralPath $postGateMarkerPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
+        Name = "Cancellation after staging removes operation outputs and workspaces"
+        Run = {
+            $job = $null
+            $processGroup = $null
+            $workerHandle = $null
+            $nativeHandle = $null
+            $operationId = [Guid]::NewGuid().ToString("N")
+            $outputDir = Join-Path $tempRoot ("cancel-output-" + $operationId)
+            $sourcePath = Join-Path $tempRoot ("cancel-source-" + $operationId + ".vtt")
+            $identityPath = Join-Path $tempRoot ("cancel-worker-" + $operationId + ".json")
+            $stagingRoot = Join-Path $outputDir (".youtube-transcript-operation-" + $operationId)
+            $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("youtube-transcript-tool-" + $operationId)
+            $gateName = "Local\TranscriptCrashSafe-" + $operationId
+            $startGate = New-StartGate -Name $gateName
+            New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+            $builder = New-Object System.Text.StringBuilder
+            [void]$builder.Append("WEBVTT`r`n`r`n00:00:00.000 --> 01:00:00.000`r`n")
+            for ($index = 0; $index -lt 120000; $index++) {
+                [void]$builder.Append("Crash-safe caption ").Append($index).Append(".`r`n")
+            }
+            [System.IO.File]::WriteAllText($sourcePath, $builder.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+
+            try {
+                $job = Start-CrashSafeSaveFixtureJob `
+                    -ModulePath (Join-Path $root "transcript-tool.psm1") `
+                    -NativeExe $nativeExe `
+                    -SourcePath $sourcePath `
+                    -OutputDir $outputDir `
+                    -OperationId $operationId `
+                    -WorkerIdentityPath $identityPath `
+                    -StartGateName $gateName
+                $workerMessage = @(Receive-LifecycleMessages -Job $job -RequiredKinds @("Worker")) |
+                    Where-Object Kind -eq "Worker" | Select-Object -First 1
+                $workerIdentity = $workerMessage.Value
+                $workerHandle = New-LifecycleTestProcessHandle -Identity $workerIdentity
+                $processGroup = New-TranscriptProcessGroup -WorkerIdentity $workerIdentity
+                [void]$startGate.Set()
+                $startGate.Dispose(); $startGate = $null
+                $nativeMessage = @(Receive-LifecycleMessages -Job $job -RequiredKinds @("Native")) |
+                    Where-Object Kind -eq "Native" | Select-Object -First 1
+                Assert-True ([bool]$nativeMessage.Value.CreateNoWindow) "Cancellation native fixture was visible."
+                $nativeHandle = New-LifecycleTestProcessHandle -Identity $nativeMessage.Value
+
+                $deadline = [DateTime]::UtcNow.AddSeconds(10)
+                while (-not (Test-Path -LiteralPath $stagingRoot) -and [DateTime]::UtcNow -lt $deadline) {
+                    Start-Sleep -Milliseconds 10
+                }
+                Assert-True (Test-Path -LiteralPath $stagingRoot) "Operation never reached its staging point."
+                $ticket = Request-TranscriptBackgroundJobStop `
+                    -Job $job -ProcessGroup $processGroup -WorkerIdentity $workerIdentity `
+                    -WorkerIdentityPath $identityPath -OperationId $operationId `
+                    -OutputDir $outputDir -TemporaryDirectory $temporaryDirectory `
+                    -StagingRoot $stagingRoot -UiDeadlineMilliseconds 100
+                Complete-TranscriptBackgroundJobCleanup -Ticket $ticket
+
+                Assert-ProcessHandleExited -ProcessHandle $workerHandle -Description "Cancelled staging worker"
+                Assert-ProcessHandleExited -ProcessHandle $nativeHandle -Description "Cancelled staging native"
+                Assert-True (-not (Get-Job -Id $job.Id -ErrorAction SilentlyContinue)) "Cancelled staging job remained."
+                Assert-True (-not (Test-Path -LiteralPath $stagingRoot)) "Operation staging root leaked."
+                Assert-True (-not (Test-Path -LiteralPath $temporaryDirectory)) "GUI temporary workspace leaked."
+                $outputs = @(Get-ChildItem -LiteralPath $outputDir -File -ErrorAction SilentlyContinue)
+                Assert-True ($outputs.Count -eq 0) "Cancellation left final/lock outputs: $($outputs.Name -join ', ')"
+                $job = $null; $processGroup = $null
+                Write-Host "PASS cancellation staging cleanup"
+            }
+            finally {
+                if ($startGate) { $startGate.Dispose() }
+                Stop-LifecycleFixture -Job $job -ProcessGroup $processGroup `
+                    -WorkerHandle $workerHandle -NativeHandle $nativeHandle
+                Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $outputDir -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $sourcePath -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $identityPath -Force -ErrorAction SilentlyContinue
             }
         }
     },

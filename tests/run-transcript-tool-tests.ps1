@@ -512,6 +512,59 @@ $tests = @(
         }
     },
     @{
+        Name = "Interrupted multi-artifact publish rolls back only identity-matched outputs"
+        Run = {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-interrupted-publish-tests-" + [Guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            try {
+                $protectedPath = Join-Path $dir "Protected.txt"
+                $protectedBytes = [byte[]]@(121, 122, 123, 124)
+                [System.IO.File]::WriteAllBytes($protectedPath, $protectedBytes)
+                $operationId = [Guid]::NewGuid().ToString("N")
+                $module = Get-Module transcript-tool
+                & $module {
+                    param($outputDir, $operation)
+                    $reservation = New-TranscriptOutputReservation `
+                        -OutputDir $outputDir `
+                        -Stem "Interrupted" `
+                        -ArtifactSuffixes @(".txt", ".vtt") `
+                        -OperationId $operation
+                    $publishError = $null
+                    try {
+                        Write-TranscriptReservationText -Reservation $reservation -Suffix ".txt" -Text "complete text"
+                        Write-TranscriptReservationText -Reservation $reservation -Suffix ".vtt" -Text "complete subtitle"
+                        Publish-TranscriptOutputReservation `
+                            -Reservation $reservation `
+                            -OnArtifactPublished {
+                                param($publishedCount, $entry)
+                                if ($publishedCount -eq 1) { throw "injected publish interruption" }
+                            }
+                    }
+                    catch { $publishError = $_ }
+                    finally {
+                        Close-TranscriptOutputReservation -Reservation $reservation -DeleteFiles $true
+                        $root = Get-TranscriptOperationStagingRoot -OutputDir $outputDir -OperationId $operation
+                        if (Test-Path -LiteralPath $root) {
+                            Remove-TranscriptOperationStagingRoot -StagingRoot $root
+                        }
+                    }
+                    if (-not $publishError -or $publishError.Exception.Message -notmatch "injected publish interruption") {
+                        throw "Interrupted publish did not exercise the expected failure."
+                    }
+                } $dir $operationId
+
+                Assert-BytesEqual -Expected $protectedBytes -Actual ([System.IO.File]::ReadAllBytes($protectedPath)) -Message "Interrupted publish changed an unrelated file."
+                Assert-True (-not (Test-Path -LiteralPath (Join-Path $dir "Interrupted.txt"))) "Interrupted publish left its first final artifact."
+                Assert-True (-not (Test-Path -LiteralPath (Join-Path $dir "Interrupted.vtt"))) "Interrupted publish left its second final artifact."
+                $leaks = @(Get-ChildItem -LiteralPath $dir -Force | Where-Object Name -like ".youtube-transcript-*")
+                Assert-True ($leaks.Count -eq 0) "Interrupted publish left staging/lock artifacts: $($leaks.Name -join ', ')"
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
         Name = "VTT conversion removes technical lines and keeps readable paragraphs"
         Run = {
             $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-tests-" + [System.Guid]::NewGuid().ToString("N"))

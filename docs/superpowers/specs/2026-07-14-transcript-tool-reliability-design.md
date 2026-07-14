@@ -50,7 +50,7 @@ The converter parses VTT/SRT structure with state rather than filtering every li
 
 Every online download uses a GUID-named temporary directory and an explicit output template. Cleanup is limited to that directory. Existing `.vtt`, `.srt`, and `.txt` files outside it are never deleted or overwritten.
 
-Before converting or copying output, the shared core atomically creates every final target for one candidate stem with `FileMode.CreateNew`. If any target already exists, it closes and removes only the targets created by that invocation and retries the next numeric stem (`-2`, `-3`, and so on). Text and subtitle bytes are written through those reserved destination streams, so concurrent GUI and CLI processes cannot claim or overwrite the same path. A transcript, its review file, and its copied subtitle always share the selected stem. Failed operations remove their own zero-byte or partial reservations without touching pre-existing files. The same rule applies to `-CleanOnly`, `-NoClean`, normal CLI downloads, and GUI-core saves.
+Before converting or copying output, the shared core atomically acquires a per-candidate `FileMode.CreateNew` lock configured with `DeleteOnClose`. Existing targets or a live lock advance the complete artifact set to the next numeric stem (`-2`, `-3`, and so on). Every text/review/subtitle artifact is written completely into an operation-GUID staging directory on the same output volume. A manifest records each target and the staging file's stable Windows volume/file-index identity before atomic no-replace renames publish any artifact; a commit marker is written only after every rename succeeds. Normal failure, hard worker termination, and interrupted multi-artifact publication therefore leave either no final set or one complete final set. Deferred GUI cleanup removes a partially published target only through an identity-validated file handle, then removes the exact operation staging and download workspaces. `DeleteOnClose` removes the interprocess lock when a worker is killed. Existing data is never deleted by path alone or overwritten. The same rule applies to `-CleanOnly`, `-NoClean`, normal CLI downloads, and GUI-core saves.
 
 ## Interfaces
 
@@ -73,6 +73,7 @@ The module regression suite will cover:
 - VTT/SRT cue text beginning exactly with `WEBVTT`, `Kind:`, or `Language:`;
 - end-to-end saving with a fake `yt-dlp` executable;
 - atomic two-process `-2`/`-3` output claims across transcript, review, and subtitle artifacts;
+- cancellation after staging and interruption after the first multi-artifact publish, including identity-safe rollback and workspace cleanup;
 - exact public result shapes, callback-output suppression, bounded diagnostics, and temporary workspace cleanup;
 - restoration of whitespace cleanup immediately inside brackets.
 

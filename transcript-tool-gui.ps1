@@ -168,6 +168,10 @@ $activeProcessGroup = $null
 $activeStartGate = $null
 $activeWorkerIdentityPath = $null
 $deferredCleanupTicket = $null
+$activeOperationId = $null
+$activeTemporaryDirectory = $null
+$activeStagingRoot = $null
+$activeOutputDir = $null
 
 $jobTimer = New-Object System.Windows.Forms.Timer
 $jobTimer.Interval = 200
@@ -280,6 +284,10 @@ $jobTimer.Add_Tick({
     $script:activeError = $null
     $script:activeWorkerIdentity = $null
     $script:activeProcessGroup = $null
+    $script:activeOperationId = $null
+    $script:activeTemporaryDirectory = $null
+    $script:activeStagingRoot = $null
+    $script:activeOutputDir = $null
 
     if ($script:activeStartGate) {
         $script:activeStartGate.Dispose()
@@ -340,6 +348,10 @@ function Request-ActiveTranscriptJobCleanup {
         -ProcessGroup $script:activeProcessGroup `
         -WorkerIdentity $script:activeWorkerIdentity `
         -WorkerIdentityPath $script:activeWorkerIdentityPath `
+        -OperationId $script:activeOperationId `
+        -OutputDir $script:activeOutputDir `
+        -TemporaryDirectory $script:activeTemporaryDirectory `
+        -StagingRoot $script:activeStagingRoot `
         -UiDeadlineMilliseconds 1500
 
     $script:activeJob = $null
@@ -348,6 +360,10 @@ function Request-ActiveTranscriptJobCleanup {
     $script:activeWorkerIdentity = $null
     $script:activeProcessGroup = $null
     $script:activeWorkerIdentityPath = $null
+    $script:activeOperationId = $null
+    $script:activeTemporaryDirectory = $null
+    $script:activeStagingRoot = $null
+    $script:activeOutputDir = $null
 }
 
 $browseButton.Add_Click({
@@ -397,6 +413,14 @@ $saveButton.Add_Click({
         $script:activeError = $null
         $script:activeWorkerIdentity = $null
         $script:activeProcessGroup = $null
+        $script:activeOperationId = [Guid]::NewGuid().ToString("N")
+        $script:activeOutputDir = $outputDir
+        $script:activeTemporaryDirectory = Join-Path `
+            ([System.IO.Path]::GetTempPath()) `
+            ("youtube-transcript-tool-" + $script:activeOperationId)
+        $script:activeStagingRoot = Join-Path `
+            $outputDir `
+            (".youtube-transcript-operation-" + $script:activeOperationId)
         $startGateName = "Local\YouTubeTranscriptTool-" + [Guid]::NewGuid().ToString("N")
         $script:activeWorkerIdentityPath = Join-Path `
             ([System.IO.Path]::GetTempPath()) `
@@ -414,7 +438,8 @@ $saveButton.Add_Click({
                 $language,
                 $keepSubtitles,
                 $startGateName,
-                $script:activeWorkerIdentityPath
+                $script:activeWorkerIdentityPath,
+                $script:activeOperationId
             ) `
             -ScriptBlock {
                 param(
@@ -424,7 +449,8 @@ $saveButton.Add_Click({
                     $language,
                     $keepSubtitles,
                     $startGateName,
-                    $workerIdentityPath
+                    $workerIdentityPath,
+                    $operationId
                 )
 
                 $ErrorActionPreference = "Stop"
@@ -458,6 +484,7 @@ $saveButton.Add_Click({
                     -OutputDir $outputDir `
                     -Language $language `
                     -KeepSubtitles:$keepSubtitles `
+                    -OperationId $operationId `
                     -OnStatus {
                         param($status)
                         [pscustomobject]@{
@@ -503,6 +530,10 @@ $saveButton.Add_Click({
         $script:activeError = $null
         $script:activeWorkerIdentity = $null
         $script:activeProcessGroup = $null
+        $script:activeOperationId = $null
+        $script:activeTemporaryDirectory = $null
+        $script:activeStagingRoot = $null
+        $script:activeOutputDir = $null
         Set-UiStatus -Label $statusLabel -Text $uiText.Error
         Show-UserError $_.Exception.Message
         $saveButton.Enabled = $true
@@ -537,6 +568,10 @@ $form.Add_FormClosing({
     $script:activeError = $null
     $script:activeWorkerIdentity = $null
     $script:activeProcessGroup = $null
+    $script:activeOperationId = $null
+    $script:activeTemporaryDirectory = $null
+    $script:activeStagingRoot = $null
+    $script:activeOutputDir = $null
 })
 
 [System.Windows.Forms.Application]::EnableVisualStyles()

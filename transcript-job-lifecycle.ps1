@@ -1,5 +1,9 @@
 $ErrorActionPreference = "Stop"
 
+if (-not ("TranscriptFileCleanupTools" -as [type])) {
+    Import-Module (Join-Path (Split-Path -Parent $PSCommandPath) "transcript-tool.psm1") -Force
+}
+
 if (-not ("TranscriptJobProcessGroup" -as [type])) {
     Add-Type @'
 using System;
@@ -447,6 +451,61 @@ function New-TranscriptProcessGroup {
     )
 }
 
+function Remove-TranscriptDeferredOperationFiles {
+    param(
+        [Parameter(Mandatory = $true)][string]$OperationId,
+        [Parameter(Mandatory = $true)][string]$OutputDir,
+        [Parameter(Mandatory = $true)][string]$TemporaryDirectory,
+        [Parameter(Mandatory = $true)][string]$StagingRoot
+    )
+
+    if ($OperationId -notmatch '^[0-9a-fA-F]{32}$') {
+        throw "Invalid transcript cleanup operation id."
+    }
+
+    $expectedTemporary = [System.IO.Path]::GetFullPath(
+        (Join-Path ([System.IO.Path]::GetTempPath()) ("youtube-transcript-tool-" + $OperationId.ToLowerInvariant()))
+    )
+    $actualTemporary = [System.IO.Path]::GetFullPath($TemporaryDirectory)
+    if ($actualTemporary -ne $expectedTemporary) {
+        throw "Transcript temporary cleanup path did not match its operation id."
+    }
+
+    $expectedStaging = [System.IO.Path]::GetFullPath(
+        (Join-Path $OutputDir (".youtube-transcript-operation-" + $OperationId.ToLowerInvariant()))
+    )
+    $actualStaging = [System.IO.Path]::GetFullPath($StagingRoot)
+    if ($actualStaging -ne $expectedStaging) {
+        throw "Transcript staging cleanup path did not match its operation id."
+    }
+
+    if (Test-Path -LiteralPath $actualStaging) {
+        $outputRoot = [System.IO.Path]::GetFullPath($OutputDir).TrimEnd('\')
+        foreach ($publication in @(Get-ChildItem -LiteralPath $actualStaging -Directory -Filter "publication-*" -ErrorAction Stop)) {
+            $commitPath = Join-Path $publication.FullName "commit.marker"
+            $manifestPath = Join-Path $publication.FullName "manifest.json"
+            if (-not (Test-Path -LiteralPath $commitPath) -and (Test-Path -LiteralPath $manifestPath)) {
+                $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+                foreach ($entry in @($manifest.Entries)) {
+                    $target = [System.IO.Path]::GetFullPath([string]$entry.TargetPath)
+                    if ((Split-Path -Parent $target).TrimEnd('\') -ne $outputRoot) {
+                        throw "Transcript cleanup manifest escaped the output directory."
+                    }
+                    [void][TranscriptFileCleanupTools]::DeleteIfIdentityMatches(
+                        $target,
+                        [string]$entry.Identity
+                    )
+                }
+            }
+        }
+        Remove-Item -LiteralPath $actualStaging -Recurse -Force -ErrorAction Stop
+    }
+
+    if (Test-Path -LiteralPath $actualTemporary) {
+        Remove-Item -LiteralPath $actualTemporary -Recurse -Force -ErrorAction Stop
+    }
+}
+
 function Request-TranscriptBackgroundJobStop {
     param(
         [Parameter(Mandatory = $true)]
@@ -457,6 +516,14 @@ function Request-TranscriptBackgroundJobStop {
         [object]$WorkerIdentity,
 
         [string]$WorkerIdentityPath,
+
+        [string]$OperationId,
+
+        [string]$OutputDir,
+
+        [string]$TemporaryDirectory,
+
+        [string]$StagingRoot,
 
         [ValidateRange(100, 2000)]
         [int]$UiDeadlineMilliseconds = 1500
@@ -470,6 +537,10 @@ function Request-TranscriptBackgroundJobStop {
         ProcessGroup = $ProcessGroup
         WorkerIdentity = $WorkerIdentity
         WorkerIdentityPath = $WorkerIdentityPath
+        OperationId = $OperationId
+        OutputDir = $OutputDir
+        TemporaryDirectory = $TemporaryDirectory
+        StagingRoot = $StagingRoot
         WasTerminal = $wasTerminal
         UiTerminationSucceeded = $false
         UiTerminationError = $null
@@ -497,6 +568,7 @@ function Complete-TranscriptBackgroundJobCleanup {
     $cleanupError = $null
     $disposeError = $null
     $removeJobError = $null
+    $operationCleanupError = $null
 
     try {
         if (-not $Ticket.WasTerminal -and -not (Test-TranscriptJobTerminal -Job $job)) {
@@ -575,6 +647,20 @@ function Complete-TranscriptBackgroundJobCleanup {
                 }
             }
         }
+
+        if ($Ticket.OperationId -and $Ticket.OutputDir -and
+            $Ticket.TemporaryDirectory -and $Ticket.StagingRoot) {
+            try {
+                Remove-TranscriptDeferredOperationFiles `
+                    -OperationId $Ticket.OperationId `
+                    -OutputDir $Ticket.OutputDir `
+                    -TemporaryDirectory $Ticket.TemporaryDirectory `
+                    -StagingRoot $Ticket.StagingRoot
+            }
+            catch {
+                $operationCleanupError = $_
+            }
+        }
     }
 
     if ($cleanupError) {
@@ -587,5 +673,9 @@ function Complete-TranscriptBackgroundJobCleanup {
 
     if ($removeJobError) {
         throw $removeJobError
+    }
+
+    if ($operationCleanupError) {
+        throw $operationCleanupError
     }
 }

@@ -1,5 +1,158 @@
 $script:SupportedTranscriptLanguages = @("auto", "ru", "en", "de")
 
+if (-not ("TranscriptFileCleanupTools" -as [type])) {
+    Add-Type @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+
+public static class TranscriptFileCleanupTools
+{
+    private const uint DELETE = 0x00010000;
+    private const uint FILE_READ_ATTRIBUTES = 0x00000080;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint FILE_SHARE_DELETE = 0x00000004;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+
+    public static FileStream OpenDeleteOnCloseLock(string path)
+    {
+        return new FileStream(
+            path,
+            FileMode.CreateNew,
+            FileAccess.ReadWrite,
+            FileShare.Read,
+            1,
+            FileOptions.DeleteOnClose);
+    }
+
+    public static string GetIdentity(string path)
+    {
+        IntPtr handle = OpenIdentityHandle(path, FILE_READ_ATTRIBUTES);
+        try { return ReadIdentity(handle); }
+        finally { CloseHandle(handle); }
+    }
+
+    public static bool DeleteIfIdentityMatches(string path, string expectedIdentity)
+    {
+        IntPtr handle = CreateFile(
+            path,
+            DELETE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            IntPtr.Zero);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            int error = Marshal.GetLastWin32Error();
+            if (error == 2 || error == 3) { return false; }
+            throw new Win32Exception(error, "Could not open transcript output for identity-safe cleanup.");
+        }
+
+        try
+        {
+            if (!String.Equals(ReadIdentity(handle), expectedIdentity, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            FILE_DISPOSITION_INFO disposition = new FILE_DISPOSITION_INFO();
+            disposition.DeleteFile = true;
+            if (!SetFileInformationByHandle(
+                handle,
+                4,
+                ref disposition,
+                (uint)Marshal.SizeOf(typeof(FILE_DISPOSITION_INFO))))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not remove matching transcript output.");
+            }
+            return true;
+        }
+        finally { CloseHandle(handle); }
+    }
+
+    private static IntPtr OpenIdentityHandle(string path, uint access)
+    {
+        IntPtr handle = CreateFile(
+            path,
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            IntPtr.Zero);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not read transcript staging identity.");
+        }
+        return handle;
+    }
+
+    private static string ReadIdentity(IntPtr handle)
+    {
+        BY_HANDLE_FILE_INFORMATION information;
+        if (!GetFileInformationByHandle(handle, out information))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not read transcript file identity.");
+        }
+        ulong index = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
+        return information.VolumeSerialNumber.ToString("X8") + ":" + index.ToString("X16");
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILE_DISPOSITION_INFO
+    {
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool DeleteFile;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateFile(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        IntPtr file,
+        out BY_HANDLE_FILE_INFORMATION information);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetFileInformationByHandle(
+        IntPtr file,
+        int informationClass,
+        ref FILE_DISPOSITION_INFO information,
+        uint size);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
+}
+'@
+}
+
 function Get-TranscriptToolRoot {
     Split-Path -Parent $PSCommandPath
 }
@@ -732,42 +885,89 @@ function Convert-SubtitleFileToTranscriptText {
     return Format-TranscriptParagraphs -Sentences $sentences
 }
 
+function New-TranscriptOperationId {
+    param([string]$OperationId)
+
+    if (-not $OperationId) {
+        return [Guid]::NewGuid().ToString("N")
+    }
+
+    if ($OperationId -notmatch '^[0-9a-fA-F]{32}$') {
+        throw "Transcript operation id must be a 32-character GUID."
+    }
+
+    return $OperationId.ToLowerInvariant()
+}
+
+function Get-TranscriptOperationStagingRoot {
+    param(
+        [Parameter(Mandatory = $true)][string]$OutputDir,
+        [Parameter(Mandatory = $true)][string]$OperationId
+    )
+
+    Join-Path $OutputDir (".youtube-transcript-operation-" + $OperationId)
+}
+
+function Remove-TranscriptPublicationArtifacts {
+    param([Parameter(Mandatory = $true)][string]$PublicationDirectory)
+
+    if (-not (Test-Path -LiteralPath $PublicationDirectory)) {
+        return
+    }
+
+    $commitPath = Join-Path $PublicationDirectory "commit.marker"
+    $manifestPath = Join-Path $PublicationDirectory "manifest.json"
+    if (-not (Test-Path -LiteralPath $commitPath) -and (Test-Path -LiteralPath $manifestPath)) {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+        foreach ($entry in @($manifest.Entries)) {
+            if ($entry.TargetPath -and $entry.Identity) {
+                [void][TranscriptFileCleanupTools]::DeleteIfIdentityMatches(
+                    [string]$entry.TargetPath,
+                    [string]$entry.Identity
+                )
+            }
+        }
+    }
+
+    Remove-Item -LiteralPath $PublicationDirectory -Recurse -Force -ErrorAction Stop
+}
+
+function Remove-TranscriptOperationStagingRoot {
+    param([Parameter(Mandatory = $true)][string]$StagingRoot)
+
+    if (-not (Test-Path -LiteralPath $StagingRoot)) {
+        return
+    }
+
+    foreach ($publication in @(Get-ChildItem -LiteralPath $StagingRoot -Directory -Filter "publication-*" -ErrorAction Stop)) {
+        Remove-TranscriptPublicationArtifacts -PublicationDirectory $publication.FullName
+    }
+    Remove-Item -LiteralPath $StagingRoot -Recurse -Force -ErrorAction Stop
+}
+
 function Close-TranscriptOutputReservation {
     param(
-        [Parameter(Mandatory = $true)]
-        [object]$Reservation,
-
+        [Parameter(Mandatory = $true)][object]$Reservation,
         [bool]$DeleteFiles
     )
 
     $cleanupError = $null
-    foreach ($entry in @($Reservation.Entries)) {
-        if ($entry.Stream) {
-            try {
-                $entry.Stream.Dispose()
-            }
-            catch {
-                if (-not $cleanupError) {
-                    $cleanupError = $_
-                }
-            }
+    try {
+        if ($Reservation.StageDirectory -and (Test-Path -LiteralPath $Reservation.StageDirectory)) {
+            Remove-TranscriptPublicationArtifacts -PublicationDirectory $Reservation.StageDirectory
         }
-
-        if ($DeleteFiles) {
-            try {
-                [System.IO.File]::Delete([string]$entry.Path)
-            }
-            catch {
-                if (-not $cleanupError) {
-                    $cleanupError = $_
-                }
-            }
+    }
+    catch {
+        $cleanupError = $_
+    }
+    finally {
+        if ($Reservation.LockStream) {
+            try { $Reservation.LockStream.Dispose() }
+            catch { if (-not $cleanupError) { $cleanupError = $_ } }
         }
     }
 
-    if ($cleanupError) {
-        throw $cleanupError
-    }
+    if ($cleanupError) { throw $cleanupError }
 }
 
 function New-TranscriptOutputReservation {
@@ -780,62 +980,57 @@ function New-TranscriptOutputReservation {
 
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string[]]$ArtifactSuffixes
+        [string[]]$ArtifactSuffixes,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OperationId
     )
 
     $suffixes = @($ArtifactSuffixes | Select-Object -Unique)
+    $stagingRoot = Get-TranscriptOperationStagingRoot -OutputDir $OutputDir -OperationId $OperationId
+    New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
 
     for ($index = 1; $true; $index++) {
         $candidateName = if ($index -eq 1) { $Stem } else { "$Stem-$index" }
         $candidateStem = Join-Path $OutputDir $candidateName
-        $entries = New-Object System.Collections.Generic.List[object]
-        $collision = $false
+        $lockName = ".youtube-transcript-lock-{0}.tmp" -f (New-SafeFilePart -Value $candidateName)
+        $lockPath = Join-Path $OutputDir $lockName
+        $lockStream = $null
 
         try {
-            foreach ($suffix in $suffixes) {
-                $path = "$candidateStem$suffix"
-                try {
-                    $stream = [System.IO.File]::Open(
-                        $path,
-                        [System.IO.FileMode]::CreateNew,
-                        [System.IO.FileAccess]::Write,
-                        [System.IO.FileShare]::None
-                    )
-                }
-                catch [System.IO.IOException] {
-                    $nativeError = $_.Exception.HResult -band 0xFFFF
-                    if ($nativeError -in 80, 183) {
-                        $collision = $true
-                        break
-                    }
-
-                    throw
-                }
-
-                $entries.Add([pscustomobject]@{
-                        Suffix = [string]$suffix
-                        Path = $path
-                        Stream = $stream
-                    })
-            }
+            $lockStream = [TranscriptFileCleanupTools]::OpenDeleteOnCloseLock($lockPath)
         }
-        catch {
-            Close-TranscriptOutputReservation `
-                -Reservation ([pscustomobject]@{ Entries = $entries.ToArray() }) `
-                -DeleteFiles $true
+        catch [System.IO.IOException] {
+            $nativeError = $_.Exception.HResult -band 0xFFFF
+            if ($nativeError -in 80, 183) { continue }
             throw
         }
 
+        $collision = @($suffixes | Where-Object { Test-Path -LiteralPath "$candidateStem$_" }).Count -gt 0
         if ($collision) {
-            Close-TranscriptOutputReservation `
-                -Reservation ([pscustomobject]@{ Entries = $entries.ToArray() }) `
-                -DeleteFiles $true
+            $lockStream.Dispose()
             continue
         }
 
+        $stageDirectory = Join-Path $stagingRoot ("publication-" + [Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $stageDirectory -ErrorAction Stop | Out-Null
+        $entries = New-Object System.Collections.Generic.List[object]
+        $entryIndex = 0
+        foreach ($suffix in $suffixes) {
+            $entries.Add([pscustomobject]@{
+                    Suffix = [string]$suffix
+                    TargetPath = "$candidateStem$suffix"
+                    StagePath = Join-Path $stageDirectory ("artifact-{0:D2}.stage" -f $entryIndex)
+                })
+            $entryIndex++
+        }
         return [pscustomobject]@{
             StemPath = $candidateStem
             Entries = $entries.ToArray()
+            LockStream = $lockStream
+            StageDirectory = $stageDirectory
+            ManifestPath = Join-Path $stageDirectory "manifest.json"
+            CommitPath = Join-Path $stageDirectory "commit.marker"
         }
     }
 }
@@ -873,16 +1068,11 @@ function Write-TranscriptReservationText {
     )
 
     $entry = Get-TranscriptReservationEntry -Reservation $Reservation -Suffix $Suffix
-    $encoding = New-Object System.Text.UTF8Encoding($true)
-    $preamble = $encoding.GetPreamble()
-    $bytes = $encoding.GetBytes($Text)
-    if ($preamble.Length -gt 0) {
-        $entry.Stream.Write($preamble, 0, $preamble.Length)
-    }
-    if ($bytes.Length -gt 0) {
-        $entry.Stream.Write($bytes, 0, $bytes.Length)
-    }
-    $entry.Stream.Flush()
+    [System.IO.File]::WriteAllText(
+        [string]$entry.StagePath,
+        $Text,
+        (New-Object System.Text.UTF8Encoding($true))
+    )
 }
 
 function Copy-TranscriptFileToReservation {
@@ -898,19 +1088,43 @@ function Copy-TranscriptFileToReservation {
     )
 
     $entry = Get-TranscriptReservationEntry -Reservation $Reservation -Suffix $Suffix
-    $sourceStream = [System.IO.File]::Open(
-        $Path,
-        [System.IO.FileMode]::Open,
-        [System.IO.FileAccess]::Read,
-        [System.IO.FileShare]::Read
+    [System.IO.File]::Copy($Path, [string]$entry.StagePath, $false)
+}
+
+function Publish-TranscriptOutputReservation {
+    param(
+        [Parameter(Mandatory = $true)][object]$Reservation,
+        [scriptblock]$OnArtifactPublished
     )
-    try {
-        $sourceStream.CopyTo($entry.Stream)
-        $entry.Stream.Flush()
+
+    $manifestEntries = @(
+        foreach ($entry in @($Reservation.Entries)) {
+            if (-not (Test-Path -LiteralPath $entry.StagePath)) {
+                throw "Transcript staging artifact is missing: $($entry.StagePath)"
+            }
+            [pscustomobject]@{
+                TargetPath = [string]$entry.TargetPath
+                Identity = [TranscriptFileCleanupTools]::GetIdentity([string]$entry.StagePath)
+            }
+        }
+    )
+    $manifestTemp = "$($Reservation.ManifestPath).tmp"
+    [System.IO.File]::WriteAllText(
+        $manifestTemp,
+        ([pscustomobject]@{ Version = 1; Entries = $manifestEntries } | ConvertTo-Json -Depth 4),
+        (New-Object System.Text.UTF8Encoding($true))
+    )
+    [System.IO.File]::Move($manifestTemp, [string]$Reservation.ManifestPath)
+
+    $publishedCount = 0
+    foreach ($entry in @($Reservation.Entries)) {
+        [System.IO.File]::Move([string]$entry.StagePath, [string]$entry.TargetPath)
+        $publishedCount++
+        if ($OnArtifactPublished) {
+            & $OnArtifactPublished $publishedCount $entry | Out-Null
+        }
     }
-    finally {
-        $sourceStream.Dispose()
-    }
+    [System.IO.File]::WriteAllText([string]$Reservation.CommitPath, "committed")
 }
 
 function Save-TranscriptFromSubtitleFileAtReservation {
@@ -961,11 +1175,14 @@ function Save-TranscriptFromSubtitleFile {
         [Parameter(Mandatory = $true)]
         [string]$OutputDir,
 
-        [bool]$CleanTranscript
+        [bool]$CleanTranscript,
+
+        [string]$OperationId
     )
 
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
+    $operation = New-TranscriptOperationId -OperationId $OperationId
     $sourceStem = [System.IO.Path]::GetFileNameWithoutExtension((Split-Path -Leaf $Path))
     $artifactSuffixes = if ($CleanTranscript) {
         @(".clean.txt", ".review.txt")
@@ -976,7 +1193,8 @@ function Save-TranscriptFromSubtitleFile {
     $reservation = New-TranscriptOutputReservation `
         -OutputDir $OutputDir `
         -Stem $sourceStem `
-        -ArtifactSuffixes $artifactSuffixes
+        -ArtifactSuffixes $artifactSuffixes `
+        -OperationId $operation
 
     $succeeded = $false
     try {
@@ -984,6 +1202,7 @@ function Save-TranscriptFromSubtitleFile {
             -Path $Path `
             -Reservation $reservation `
             -CleanTranscript $CleanTranscript
+        Publish-TranscriptOutputReservation -Reservation $reservation
         $succeeded = $true
         return $result
     }
@@ -991,6 +1210,10 @@ function Save-TranscriptFromSubtitleFile {
         Close-TranscriptOutputReservation `
             -Reservation $reservation `
             -DeleteFiles (-not $succeeded)
+        $stagingRoot = Get-TranscriptOperationStagingRoot -OutputDir $OutputDir -OperationId $operation
+        if (Test-Path -LiteralPath $stagingRoot) {
+            Remove-TranscriptOperationStagingRoot -StagingRoot $stagingRoot
+        }
     }
 }
 
@@ -1206,11 +1429,14 @@ function Save-TranscriptFromYoutubeCli {
 
         [string]$YtDlpPath,
 
-        [scriptblock]$OnAttempt
+        [scriptblock]$OnAttempt,
+
+        [string]$OperationId
     )
 
     $tool = Get-YtDlpPath -PreferredPath $YtDlpPath
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    $operation = New-TranscriptOperationId -OperationId $OperationId
 
     $plan = Get-CliSubtitleLanguagePlan `
         -Url $Url `
@@ -1296,7 +1522,8 @@ function Save-TranscriptFromYoutubeCli {
                 $reservation = New-TranscriptOutputReservation `
                     -OutputDir $OutputDir `
                     -Stem ([string]$subtitleGroup.Name) `
-                    -ArtifactSuffixes $relatedSuffixes
+                    -ArtifactSuffixes $relatedSuffixes `
+                    -OperationId $operation
                 $groupSucceeded = $false
                 try {
                     foreach ($subtitle in $relatedSubtitles) {
@@ -1306,6 +1533,7 @@ function Save-TranscriptFromYoutubeCli {
                             -Suffix $subtitle.Extension
                         $subtitlePaths.Add("$($reservation.StemPath)$($subtitle.Extension)")
                     }
+                    Publish-TranscriptOutputReservation -Reservation $reservation
                     $groupSucceeded = $true
                 }
                 finally {
@@ -1348,7 +1576,8 @@ function Save-TranscriptFromYoutubeCli {
         $reservation = New-TranscriptOutputReservation `
             -OutputDir $OutputDir `
             -Stem $selectedStem `
-            -ArtifactSuffixes $artifactSuffixes
+            -ArtifactSuffixes $artifactSuffixes `
+            -OperationId $operation
         $reservationSucceeded = $false
         try {
             $saved = Save-TranscriptFromSubtitleFileAtReservation `
@@ -1365,6 +1594,7 @@ function Save-TranscriptFromYoutubeCli {
                     -Suffix $selected.Extension
                 $subtitlePaths = @($destination)
             }
+            Publish-TranscriptOutputReservation -Reservation $reservation
             $reservationSucceeded = $true
         }
         finally {
@@ -1387,6 +1617,10 @@ function Save-TranscriptFromYoutubeCli {
     }
     finally {
         Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        $stagingRoot = Get-TranscriptOperationStagingRoot -OutputDir $OutputDir -OperationId $operation
+        if (Test-Path -LiteralPath $stagingRoot) {
+            Remove-TranscriptOperationStagingRoot -StagingRoot $stagingRoot
+        }
     }
 }
 
@@ -1406,7 +1640,9 @@ function Save-TranscriptFromYoutube {
 
         [string]$YtDlpPath,
 
-        [scriptblock]$OnStatus
+        [scriptblock]$OnStatus,
+
+        [string]$OperationId
     )
 
     if (-not (Test-YoutubeUrl -Url $Url)) {
@@ -1414,6 +1650,7 @@ function Save-TranscriptFromYoutube {
     }
 
     $tool = Get-YtDlpPath -PreferredPath $YtDlpPath
+    $operation = New-TranscriptOperationId -OperationId $OperationId
 
     if (-not (Test-Path -LiteralPath $OutputDir)) {
         try {
@@ -1439,7 +1676,7 @@ function Save-TranscriptFromYoutube {
     if ($OnStatus) { & $OnStatus "Looking for subtitles" }
     $choice = Resolve-TranscriptSubtitleChoice -Info $info -Preference $Language
 
-    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("youtube-transcript-tool-" + [System.Guid]::NewGuid().ToString("N"))
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("youtube-transcript-tool-" + $operation)
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
     try {
@@ -1496,7 +1733,8 @@ function Save-TranscriptFromYoutube {
         $reservation = New-TranscriptOutputReservation `
             -OutputDir $OutputDir `
             -Stem $outputStemName `
-            -ArtifactSuffixes $artifactSuffixes
+            -ArtifactSuffixes $artifactSuffixes `
+            -OperationId $operation
         $reservationSucceeded = $false
         try {
             $txtPath = "$($reservation.StemPath).txt"
@@ -1514,6 +1752,7 @@ function Save-TranscriptFromYoutube {
                     -Reservation $reservation `
                     -Suffix $subtitleFile.Extension
             }
+            Publish-TranscriptOutputReservation -Reservation $reservation
             $reservationSucceeded = $true
         }
         finally {
@@ -1541,6 +1780,10 @@ function Save-TranscriptFromYoutube {
     }
     finally {
         Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        $stagingRoot = Get-TranscriptOperationStagingRoot -OutputDir $OutputDir -OperationId $operation
+        if (Test-Path -LiteralPath $stagingRoot) {
+            Remove-TranscriptOperationStagingRoot -StagingRoot $stagingRoot
+        }
     }
 }
 

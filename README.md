@@ -64,7 +64,7 @@ The default command downloads subtitles into an isolated temporary folder, conve
 
 ## File Safety
 
-The tool does not delete or overwrite existing `.txt`, `.vtt`, or `.srt` files. It atomically claims the complete set of final output files, so simultaneous desktop and command-line saves use distinct shared suffixes such as `-2` and `-3`. This keeps a transcript, its review file, and its saved subtitle coordinated while preserving existing files byte-for-byte. If conversion fails, only that run's newly claimed empty or partial outputs are removed.
+The tool does not delete or overwrite existing `.txt`, `.vtt`, or `.srt` files. It atomically locks one shared stem, writes complete artifacts in an operation-specific staging area, and publishes them with no-overwrite renames, so simultaneous desktop and command-line saves use distinct suffixes such as `-2` and `-3`. If conversion is cancelled or the desktop worker is terminated, operation-specific staging/download files and identity-matching partial publication are removed without touching pre-existing data.
 
 ## Create A Desktop Shortcut
 
