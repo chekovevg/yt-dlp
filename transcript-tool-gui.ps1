@@ -160,6 +160,106 @@ $resultBox.ReadOnly = $true
 $form.Controls.Add($resultBox)
 
 $lastOutputDir = $folderBox.Text
+$activeJob = $null
+$activeResult = $null
+$activeError = $null
+
+$jobTimer = New-Object System.Windows.Forms.Timer
+$jobTimer.Interval = 200
+
+$jobTimer.Add_Tick({
+    $job = $script:activeJob
+    if (-not $job) {
+        $jobTimer.Stop()
+        return
+    }
+
+    $receivedErrors = @()
+    $messages = @(Receive-Job `
+        -Job $job `
+        -ErrorAction SilentlyContinue `
+        -ErrorVariable +receivedErrors)
+    $jobState = $job.State
+
+    if ($jobState -in "Completed", "Failed", "Stopped") {
+        $messages += @(Receive-Job `
+            -Job $job `
+            -ErrorAction SilentlyContinue `
+            -ErrorVariable +receivedErrors)
+    }
+
+    if (-not $script:activeError -and $receivedErrors.Count -gt 0) {
+        $script:activeError = $receivedErrors[0]
+    }
+
+    foreach ($message in $messages) {
+        switch ([string]$message.Kind) {
+            "Status" {
+                $status = [string]$message.Value
+                switch ($status) {
+                    "Checking link" { Set-UiStatus -Label $statusLabel -Text $uiText.Checking }
+                    "Looking for subtitles" { Set-UiStatus -Label $statusLabel -Text $uiText.Looking }
+                    "Saving file" { Set-UiStatus -Label $statusLabel -Text $uiText.Saving }
+                    "Done" { Set-UiStatus -Label $statusLabel -Text $uiText.Done }
+                    default { Set-UiStatus -Label $statusLabel -Text $status }
+                }
+            }
+            "Result" {
+                $script:activeResult = $message.Value
+            }
+        }
+    }
+
+    if ($jobState -notin "Completed", "Failed", "Stopped") {
+        return
+    }
+
+    $jobTimer.Stop()
+
+    if (-not $script:activeError) {
+        $script:activeError = $job.ChildJobs |
+            ForEach-Object { $_.Error } |
+            Select-Object -First 1
+    }
+
+    $result = $script:activeResult
+    $jobError = $script:activeError
+    $jobReason = $job.JobStateInfo.Reason
+
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    $script:activeJob = $null
+    $script:activeResult = $null
+    $script:activeError = $null
+
+    $saveButton.Enabled = $true
+    $browseButton.Enabled = $true
+
+    if ($jobState -eq "Completed" -and $result) {
+        $script:lastOutputDir = [string]$result.OutputDir
+        $resultBox.Text = [string]$result.TextPath
+        $openFolderButton.Enabled = $true
+        Set-UiStatus -Label $statusLabel -Text ($uiText.DoneFormat -f $result.Language, $result.Source)
+        return
+    }
+
+    $openFolderButton.Enabled = $false
+    Set-UiStatus -Label $statusLabel -Text $uiText.Error
+
+    $errorMessage = if ($jobError -and $jobError.Exception -and $jobError.Exception.Message) {
+        $jobError.Exception.Message
+    }
+    elseif ($jobError) {
+        [string]$jobError
+    }
+    elseif ($jobReason -and $jobReason.Message) {
+        $jobReason.Message
+    }
+    else {
+        "The transcript save did not return a result."
+    }
+
+    Show-UserError $errorMessage
+})
 
 $browseButton.Add_Click({
     $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -203,36 +303,75 @@ $saveButton.Add_Click({
     try {
         Write-TranscriptSettings -OutputDir $outputDir -Language $language -KeepSubtitles:$keepSubtitles
 
-        $result = Save-TranscriptFromYoutube `
-            -Url $url `
-            -OutputDir $outputDir `
-            -Language $language `
-            -KeepSubtitles:$keepSubtitles `
-            -OnStatus {
-                param($status)
-                switch ($status) {
-                    "Checking link" { Set-UiStatus -Label $statusLabel -Text $uiText.Checking }
-                    "Looking for subtitles" { Set-UiStatus -Label $statusLabel -Text $uiText.Looking }
-                    "Saving file" { Set-UiStatus -Label $statusLabel -Text $uiText.Saving }
-                    "Done" { Set-UiStatus -Label $statusLabel -Text $uiText.Done }
-                    default { Set-UiStatus -Label $statusLabel -Text $status }
-                }
-            }
+        $modulePath = Join-Path $root "transcript-tool.psm1"
+        $script:activeResult = $null
+        $script:activeError = $null
+        $script:activeJob = Start-Job `
+            -ArgumentList @($modulePath, $url, $outputDir, $language, $keepSubtitles) `
+            -ScriptBlock {
+                param($modulePath, $url, $outputDir, $language, $keepSubtitles)
 
-        $lastOutputDir = $result.OutputDir
-        $resultBox.Text = $result.TextPath
-        $openFolderButton.Enabled = $true
-        Set-UiStatus -Label $statusLabel -Text ($uiText.DoneFormat -f $result.Language, $result.Source)
+                $ErrorActionPreference = "Stop"
+                Import-Module $modulePath -Force
+
+                Save-TranscriptFromYoutube `
+                    -Url $url `
+                    -OutputDir $outputDir `
+                    -Language $language `
+                    -KeepSubtitles:$keepSubtitles `
+                    -OnStatus {
+                        param($status)
+                        [pscustomobject]@{
+                            Kind = "Status"
+                            Value = $status
+                        }
+                    } |
+                    ForEach-Object {
+                        if ([string]$_.Kind -eq "Status") {
+                            $_
+                        }
+                        else {
+                            [pscustomobject]@{
+                                Kind = "Result"
+                                Value = $_
+                            }
+                        }
+                    }
+                }
+
+        $jobTimer.Start()
     }
     catch {
+        $jobTimer.Stop()
+
+        if ($script:activeJob) {
+            Stop-Job -Job $script:activeJob -ErrorAction SilentlyContinue
+            Remove-Job -Job $script:activeJob -Force -ErrorAction SilentlyContinue
+            $script:activeJob = $null
+        }
+
+        $script:activeResult = $null
+        $script:activeError = $null
         Set-UiStatus -Label $statusLabel -Text $uiText.Error
         Show-UserError $_.Exception.Message
-    }
-    finally {
         $saveButton.Enabled = $true
         $browseButton.Enabled = $true
     }
 })
 
+$form.Add_FormClosing({
+    $jobTimer.Stop()
+
+    if ($script:activeJob) {
+        Stop-Job -Job $script:activeJob -ErrorAction SilentlyContinue
+        Remove-Job -Job $script:activeJob -Force -ErrorAction SilentlyContinue
+        $script:activeJob = $null
+    }
+
+    $script:activeResult = $null
+    $script:activeError = $null
+})
+
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::Run($form)
+$jobTimer.Dispose()

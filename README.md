@@ -9,6 +9,7 @@ The tool uses the local `yt-dlp.exe` in this folder. It does not download video 
 - Opens as a small desktop window.
 - Accepts a YouTube video link.
 - Saves a `.txt` transcript to a chosen local folder.
+- Remains usable while `yt-dlp` is running in the background.
 - Remembers the save folder, subtitle language, and "also save subtitles" checkbox between launches.
 - Can optionally save the original `.vtt` subtitle file next to the `.txt`.
 
@@ -128,6 +129,12 @@ For publishing-quality text, use original-language subtitles as a draft and edit
 10. Try a language that is unavailable and confirm the error lists available languages.
 
 ## Developer Checks
+
+Run the desktop launch/responding smoke test:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-gui-smoke-tests.ps1
+```
 
 Run backend smoke tests:
 
