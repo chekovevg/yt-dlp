@@ -676,6 +676,8 @@ $tests = @(
             $nativeIdentity = $null
             $workerHandle = $null
             $nativeHandle = $null
+            $realProcessGroup = $null
+            $groupWrapper = $null
             $identityPath = Join-Path $tempRoot ("fallback-exception-" + [Guid]::NewGuid().ToString("N") + ".json")
             $postGateMarkerPath = Join-Path $tempRoot ("fallback-exception-post-gate-" + [Guid]::NewGuid().ToString("N"))
             $gateName = "Local\TranscriptLifecycle-" + [Guid]::NewGuid().ToString("N")
@@ -690,6 +692,25 @@ $tests = @(
                 $workerMessages = @(Receive-LifecycleMessages -Job $job -RequiredKinds @("Worker"))
                 $workerIdentity = ($workerMessages | Where-Object Kind -eq "Worker" | Select-Object -First 1).Value
                 $workerHandle = New-LifecycleTestProcessHandle -Identity $workerIdentity
+                $realProcessGroup = New-TranscriptProcessGroup -WorkerIdentity $workerIdentity
+                $groupWrapper = [pscustomobject]@{
+                    Inner = $realProcessGroup
+                    JobId = $job.Id
+                    TerminateCalls = 0
+                    DisposeCalls = 0
+                    JobPresentAtDispose = $false
+                }
+                $groupWrapper | Add-Member ScriptMethod Terminate {
+                    $this.TerminateCalls++
+                    throw "forced process-group termination failure"
+                }
+                $groupWrapper | Add-Member ScriptMethod Dispose {
+                    $this.DisposeCalls++
+                    $this.JobPresentAtDispose = [bool](
+                        Get-Job -Id $this.JobId -ErrorAction SilentlyContinue
+                    )
+                    $this.Inner.Dispose()
+                }
                 [void]$startGate.Set()
                 $startGate.Dispose()
                 $startGate = $null
@@ -697,33 +718,20 @@ $tests = @(
                 $nativeIdentity = ($nativeMessages | Where-Object Kind -eq "Native" | Select-Object -First 1).Value
                 $nativeHandle = New-LifecycleTestProcessHandle -Identity $nativeIdentity
 
-                $failingGroup = [pscustomobject]@{
-                    TerminateCalls = 0
-                    DisposeCalls = 0
-                }
-                $failingGroup | Add-Member ScriptMethod Terminate {
-                    $this.TerminateCalls++
-                    throw "forced process-group termination failure"
-                }
-                $failingGroup | Add-Member ScriptMethod Dispose { $this.DisposeCalls++ }
-
                 $ticket = Request-TranscriptBackgroundJobStop `
                     -Job $job `
-                    -ProcessGroup $failingGroup `
+                    -ProcessGroup $groupWrapper `
                     -WorkerIdentity $workerIdentity `
                     -WorkerIdentityPath $identityPath `
                     -UiDeadlineMilliseconds 1500
                 $treeTerminator = {
                     param($ignoredIdentity)
 
-                    $nativeHandle.Terminate()
-                    $workerHandle.Terminate()
-                    [void]$nativeHandle.WaitForExit(3000)
-                    [void]$workerHandle.WaitForExit(3000)
                     throw "injected process-tree fallback failure"
                 }.GetNewClosure()
 
                 $cleanupError = $null
+                $cleanupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
                 try {
                     Complete-TranscriptBackgroundJobCleanup `
                         -Ticket $ticket `
@@ -732,24 +740,34 @@ $tests = @(
                 catch {
                     $cleanupError = $_
                 }
+                $cleanupStopwatch.Stop()
 
                 Assert-True ([bool]$cleanupError) "Expected injected fallback exception to propagate after cleanup."
                 Assert-True `
                     ($cleanupError.Exception.Message -match "injected process-tree fallback failure") `
                     "Unexpected fallback exception: $($cleanupError.Exception.Message)"
+                Assert-True `
+                    $groupWrapper.JobPresentAtDispose `
+                    "Process group was disposed only after the PowerShell job was removed."
+                Assert-True `
+                    ($cleanupStopwatch.ElapsedMilliseconds -le 5000) `
+                    "Fallback exception cleanup took $($cleanupStopwatch.ElapsedMilliseconds) ms."
                 Assert-ProcessHandleExited -ProcessHandle $workerHandle -Description "Injected-failure worker"
                 Assert-ProcessHandleExited -ProcessHandle $nativeHandle -Description "Injected-failure native"
                 Assert-True (-not (Get-Job -Id $job.Id -ErrorAction SilentlyContinue)) "Fallback exception skipped job removal."
                 Assert-True (-not (Test-Path -LiteralPath $identityPath)) "Fallback exception skipped identity cleanup."
-                Assert-True ($failingGroup.DisposeCalls -eq 1) "Fallback exception skipped process-group disposal."
+                Assert-True ($groupWrapper.DisposeCalls -eq 1) "Fallback exception skipped process-group disposal."
 
+                $realProcessGroup = $null
+                $groupWrapper = $null
                 $job = $null
-                Write-Host "PASS fallback exception cleanup"
+                Write-Host "PASS $($cleanupStopwatch.ElapsedMilliseconds) ms - fallback exception cleanup"
             }
             finally {
                 if ($startGate) { $startGate.Dispose() }
                 Stop-LifecycleFixture `
                     -Job $job `
+                    -ProcessGroup $groupWrapper `
                     -WorkerHandle $workerHandle `
                     -NativeHandle $nativeHandle `
                     -WorkerIdentity $workerIdentity `

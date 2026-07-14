@@ -519,6 +519,7 @@ function Complete-TranscriptBackgroundJobCleanup {
     $group = $Ticket.ProcessGroup
     $identity = $Ticket.WorkerIdentity
     $cleanupError = $null
+    $disposeError = $null
     $removeJobError = $null
 
     try {
@@ -566,6 +567,15 @@ function Complete-TranscriptBackgroundJobCleanup {
         $cleanupError = $_
     }
     finally {
+        if ($group) {
+            try {
+                $group.Dispose()
+            }
+            catch {
+                $disposeError = $_
+            }
+        }
+
         try {
             Remove-Job -Job $job -Force -ErrorAction Stop
         }
@@ -573,28 +583,18 @@ function Complete-TranscriptBackgroundJobCleanup {
             $removeJobError = $_
         }
         finally {
-            if ($group) {
+            if ($Ticket.WorkerIdentityPath) {
                 try {
-                    $group.Dispose()
-                }
-                catch {
-                    if (-not $cleanupError) {
-                        $cleanupError = $_
+                    if (Test-Path -LiteralPath $Ticket.WorkerIdentityPath) {
+                        Remove-Item `
+                            -LiteralPath $Ticket.WorkerIdentityPath `
+                            -Force `
+                            -ErrorAction Stop
                     }
                 }
-            }
-
-            if ($Ticket.WorkerIdentityPath -and
-                (Test-Path -LiteralPath $Ticket.WorkerIdentityPath)) {
-                try {
-                    Remove-Item `
-                        -LiteralPath $Ticket.WorkerIdentityPath `
-                        -Force `
-                        -ErrorAction Stop
-                }
                 catch {
-                    if (-not $cleanupError) {
-                        $cleanupError = $_
+                    if (-not $disposeError) {
+                        $disposeError = $_
                     }
                 }
             }
@@ -603,6 +603,10 @@ function Complete-TranscriptBackgroundJobCleanup {
 
     if ($cleanupError) {
         throw $cleanupError
+    }
+
+    if ($disposeError) {
+        throw $disposeError
     }
 
     if ($removeJobError) {
