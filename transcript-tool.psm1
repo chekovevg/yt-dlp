@@ -98,6 +98,107 @@ function Test-YoutubeUrl {
     return ($Url -match '^https?://(www\.)?(youtube\.com|youtu\.be)/')
 }
 
+function ConvertTo-NativeArgument {
+    param(
+        [AllowNull()]
+        [string]$Argument
+    )
+
+    if ($null -eq $Argument) {
+        $Argument = ""
+    }
+
+    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+
+    $escaped = New-Object System.Text.StringBuilder
+    [void]$escaped.Append('"')
+    $backslashCount = 0
+
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq [char]'\') {
+            $backslashCount++
+            continue
+        }
+
+        if ($character -eq [char]'"') {
+            if ($backslashCount -gt 0) {
+                [void]$escaped.Append((New-Object string ([char]'\'), ($backslashCount * 2)))
+            }
+
+            [void]$escaped.Append('\"')
+            $backslashCount = 0
+            continue
+        }
+
+        if ($backslashCount -gt 0) {
+            [void]$escaped.Append((New-Object string ([char]'\'), $backslashCount))
+            $backslashCount = 0
+        }
+
+        [void]$escaped.Append($character)
+    }
+
+    if ($backslashCount -gt 0) {
+        [void]$escaped.Append((New-Object string ([char]'\'), ($backslashCount * 2)))
+    }
+
+    [void]$escaped.Append('"')
+    return $escaped.ToString()
+}
+
+function Invoke-TranscriptProcess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [string[]]$ArgumentList = @(),
+
+        [string]$WorkingDirectory
+    )
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = (($ArgumentList | ForEach-Object { ConvertTo-NativeArgument -Argument $_ }) -join " ")
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+
+    if ($WorkingDirectory) {
+        $startInfo.WorkingDirectory = $WorkingDirectory
+    }
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+
+    try {
+        if (-not $process.Start()) {
+            throw "Could not start process: $FilePath"
+        }
+
+        $stdOutTask = $process.StandardOutput.ReadToEndAsync()
+        $stdErrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+
+        $stdOut = $stdOutTask.GetAwaiter().GetResult()
+        $stdErr = $stdErrTask.GetAwaiter().GetResult()
+        $output = @($stdOut, $stdErr) |
+            Where-Object { -not [string]::IsNullOrEmpty($_) }
+
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            StdOut = $stdOut
+            StdErr = $stdErr
+            Output = ($output -join [System.Environment]::NewLine)
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 function Invoke-YtDlpJson {
     param(
         [Parameter(Mandatory = $true)]
@@ -107,11 +208,12 @@ function Invoke-YtDlpJson {
         [string]$Url
     )
 
-    $output = & $YtDlpPath --skip-download --dump-single-json --no-warnings --no-playlist $Url 2>&1
-    $exitCode = $LASTEXITCODE
+    $result = Invoke-TranscriptProcess -FilePath $YtDlpPath -ArgumentList @(
+        '--skip-download', '--dump-single-json', '--no-warnings', '--no-playlist', $Url
+    )
 
-    if ($exitCode -ne 0) {
-        $message = ($output -join "`n").Trim()
+    if ($result.ExitCode -ne 0) {
+        $message = $result.Output.Trim()
 
         if ($message -match "Unsupported URL|Invalid URL") {
             throw "The YouTube link looks invalid. Please paste a normal youtube.com or youtu.be video link."
@@ -129,7 +231,7 @@ function Invoke-YtDlpJson {
     }
 
     try {
-        return (($output -join "`n") | ConvertFrom-Json)
+        return ($result.StdOut | ConvertFrom-Json)
     }
     catch {
         throw "yt-dlp returned metadata that this tool could not read."
@@ -454,8 +556,9 @@ function Save-TranscriptFromYoutube {
         $args += $Url
 
         if ($OnStatus) { & $OnStatus "Saving file" }
-        $downloadOutput = & $tool @args 2>&1
-        $exitCode = $LASTEXITCODE
+        $downloadResult = Invoke-TranscriptProcess -FilePath $tool -ArgumentList $args
+        $downloadOutput = $downloadResult.Output
+        $exitCode = $downloadResult.ExitCode
         $subtitleFile = Get-ChildItem -LiteralPath $tempDir -File |
             Where-Object { $_.Extension -in ".vtt", ".srt" } |
             Sort-Object LastWriteTimeUtc -Descending |
@@ -516,6 +619,7 @@ Export-ModuleMember -Function @(
     "Write-TranscriptSettings",
     "Get-YtDlpPath",
     "Test-YoutubeUrl",
+    "Invoke-TranscriptProcess",
     "Invoke-YtDlpJson",
     "Get-AvailableTranscriptLanguages",
     "Resolve-TranscriptSubtitleChoice",

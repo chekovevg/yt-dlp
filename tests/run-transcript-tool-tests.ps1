@@ -4,6 +4,40 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $modulePath = Join-Path $repoRoot "transcript-tool.psm1"
 Import-Module $modulePath -Force
 
+function New-FakeYtDlp {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $source = @'
+using System;
+using System.IO;
+using System.Linq;
+using System.Text;
+
+public class Program {
+    public static int Main(string[] args) {
+        var url = args.Length == 0 ? "" : args[args.Length - 1];
+        if (url.Contains("unavailable")) {
+            Console.Error.WriteLine("ERROR: Video unavailable");
+            return 1;
+        }
+        if (args.Contains("--dump-single-json")) {
+            Console.Error.WriteLine("WARNING: harmless warning");
+            Console.WriteLine("{\"id\":\"abc123\",\"title\":\"Test\",\"subtitles\":{},\"automatic_captions\":{\"ru\":[{\"ext\":\"vtt\"}]}}");
+            return 0;
+        }
+        var outputIndex = Array.IndexOf(args, "-o");
+        var template = args[outputIndex + 1];
+        var directory = Path.GetDirectoryName(template);
+        Directory.CreateDirectory(directory);
+        File.WriteAllText(Path.Combine(directory, "abc123.ru.vtt"), "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nWorking transcript\n", new UTF8Encoding(false));
+        Console.Error.WriteLine("WARNING: harmless warning");
+        return 0;
+    }
+}
+'@
+    Add-Type -TypeDefinition $source -OutputAssembly $Path -OutputType ConsoleApplication
+}
+
 function Assert-True {
     param(
         [Parameter(Mandatory = $true)]
@@ -98,21 +132,49 @@ $tests = @(
                 Remove-Item -LiteralPath $dir -Recurse -Force
             }
         }
+    },
+    @{
+        Name = "yt-dlp warning on stderr does not abort successful metadata"
+        Run = {
+            $info = Invoke-YtDlpJson -YtDlpPath $fakeYtDlpPath -Url "https://youtube.com/watch?v=working"
+            Assert-True ($info.id -eq "abc123") "Expected abc123, got $($info.id)"
+        }
+    },
+    @{
+        Name = "Unavailable video stderr maps to friendly message"
+        Run = {
+            try {
+                Invoke-YtDlpJson -YtDlpPath $fakeYtDlpPath -Url "https://youtube.com/watch?v=unavailable" | Out-Null
+                throw "Expected unavailable-video error."
+            }
+            catch {
+                Assert-True ($_.Exception.Message -eq "This video is unavailable without login or cannot be accessed by yt-dlp.") "Unexpected error: $($_.Exception.Message)"
+            }
+        }
     }
 )
 
 $failed = 0
+$fakeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-native-tests-" + [System.Guid]::NewGuid().ToString("N"))
+$fakeYtDlpPath = Join-Path $fakeRoot "yt-dlp.exe"
+New-Item -ItemType Directory -Path $fakeRoot -Force | Out-Null
+New-FakeYtDlp -Path $fakeYtDlpPath
 
-foreach ($test in $tests) {
-    try {
-        & $test.Run
-        Write-Host "PASS $($test.Name)"
+try {
+    foreach ($test in $tests) {
+        try {
+            & $test.Run
+            Write-Host "PASS $($test.Name)"
+        }
+        catch {
+            $failed++
+            Write-Host "FAIL $($test.Name)"
+            Write-Host $_.Exception.Message
+        }
     }
-    catch {
-        $failed++
-        Write-Host "FAIL $($test.Name)"
-        Write-Host $_.Exception.Message
-    }
+}
+finally {
+    Remove-Item -LiteralPath $fakeRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 if ($failed -gt 0) {
