@@ -16,7 +16,7 @@
 - Preserve CLI switches: `-List`, `-CleanOnly`, `-NoClean`, `-KeepSubs`, `-Srt`, `-CleanTranscript`, `-Prefer`, `-OutputDir`, and `-Langs`.
 - Never delete `.vtt`, `.srt`, or `.txt` files that existed before the current invocation.
 - Keep transcript-specific normalization opt-in behind `-CleanTranscript`.
-- Add a failing regression test before each production behavior change.
+- Add a failing regression test before each production behavior change except the WinForms thread handoff, for which the user explicitly approved a launch/responding smoke test plus live verification instead of test-only UI hooks.
 
 ---
 

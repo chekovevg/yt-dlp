@@ -1,0 +1,377 @@
+$ErrorActionPreference = "Stop"
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$scriptUnderTest = Join-Path $repoRoot "download-subs.ps1"
+
+function New-FakeExe {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Source
+    )
+
+    Add-Type -TypeDefinition $Source -OutputAssembly $Path -OutputType ConsoleApplication
+}
+
+function New-TestWorkspace {
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("download-subs-tests-" + [System.Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    Copy-Item -LiteralPath $scriptUnderTest -Destination (Join-Path $dir "download-subs.ps1")
+
+    $ytDlpSource = @'
+using System;
+using System.IO;
+using System.Linq;
+using System.Text;
+
+public class Program {
+    public static int Main(string[] args) {
+        if (args.Contains("--print")) {
+            var printUrl = args.Length == 0 ? "" : args[args.Length - 1];
+            if (printUrl.Contains("unknown-language")) {
+                Console.WriteLine("NA");
+                return 0;
+            }
+
+            if (printUrl.Contains("german-video")) {
+                Console.WriteLine("de");
+                return 0;
+            }
+
+            Console.WriteLine("en");
+            return 0;
+        }
+
+        if (args.Contains("--list-subs")) {
+            Console.WriteLine("en, ru");
+            return 0;
+        }
+
+        var url = args.Length == 0 ? "" : args[args.Length - 1];
+
+        if (url.Contains("existing")) {
+            return 0;
+        }
+
+        if (url.Contains("fresh")) {
+            File.WriteAllText(
+                Path.Combine(Environment.CurrentDirectory, "Fresh [fresh].en.vtt"),
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nFresh &amp; clean\n",
+                new UTF8Encoding(false));
+            return 0;
+        }
+
+        if (url.Contains("unknown-language")) {
+            var langIndex = Array.IndexOf(args, "--sub-langs");
+            var requestedLangs = langIndex >= 0 && langIndex + 1 < args.Length ? args[langIndex + 1] : "";
+
+            if (requestedLangs == "ru-orig" || requestedLangs == "ru") {
+                File.WriteAllText(
+                    Path.Combine(Environment.CurrentDirectory, "Unknown [unknown-language].ru.vtt"),
+                    "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nRussian first\n",
+                    new UTF8Encoding(false));
+            }
+
+            return 0;
+        }
+
+        if (url.Contains("german-video")) {
+            var langIndex = Array.IndexOf(args, "--sub-langs");
+            var requestedLangs = langIndex >= 0 && langIndex + 1 < args.Length ? args[langIndex + 1] : "";
+
+            if (requestedLangs == "de-orig" || requestedLangs == "de") {
+                File.WriteAllText(
+                    Path.Combine(Environment.CurrentDirectory, "German [german-video].de.vtt"),
+                    "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nGuten Tag\n",
+                    new UTF8Encoding(false));
+            }
+
+            return 0;
+        }
+
+        if (url.Contains("prefer-german")) {
+            var langIndex = Array.IndexOf(args, "--sub-langs");
+            var requestedLangs = langIndex >= 0 && langIndex + 1 < args.Length ? args[langIndex + 1] : "";
+
+            if (requestedLangs == "de-orig" || requestedLangs == "de") {
+                File.WriteAllText(
+                    Path.Combine(Environment.CurrentDirectory, "Prefer German [prefer-german].de.vtt"),
+                    "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nNur Deutsch\n",
+                    new UTF8Encoding(false));
+            }
+
+            return 0;
+        }
+
+        return 1;
+    }
+}
+'@
+
+    $notepadSource = @'
+public class Program {
+    public static int Main(string[] args) {
+        return 0;
+    }
+}
+'@
+
+    New-FakeExe -Path (Join-Path $dir "yt-dlp.exe") -Source $ytDlpSource
+    New-FakeExe -Path (Join-Path $dir "notepad.exe") -Source $notepadSource
+
+    return $dir
+}
+
+function Invoke-DownloadSubs {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = "powershell.exe"
+    $psi.WorkingDirectory = $Directory
+    $escapedArgs = $Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') {
+            '"' + ($_ -replace '"', '\"') + '"'
+        }
+        else {
+            $_
+        }
+    }
+    $psi.Arguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", ('"' + (Join-Path $Directory "download-subs.ps1") + '"')
+    ) + $escapedArgs -join " "
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["PATH"] = $Directory + [System.IO.Path]::PathSeparator + $psi.EnvironmentVariables["PATH"]
+
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+
+    [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        StdOut = $stdout
+        StdErr = $stderr
+        Output = ($stdout + "`n" + $stderr)
+    }
+}
+
+function Assert-True {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$Condition,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    if (-not $Condition) {
+        throw $Message
+    }
+}
+
+function Utf8 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Bytes
+    )
+
+    [System.Text.Encoding]::UTF8.GetString($Bytes)
+}
+
+$tests = @(
+    @{
+        Name = "CleanOnly without subtitle files reports the intended error"
+        Run = {
+            $dir = New-TestWorkspace
+            try {
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("-CleanOnly")
+                Assert-True ($result.ExitCode -ne 0) "Expected a non-zero exit code."
+                Assert-True ($result.Output -match "No \.vtt or \.srt files were found") "Expected missing subtitle message, got: $($result.Output)"
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "CleanOnly decodes common HTML entities through the platform decoder"
+        Run = {
+            $dir = New-TestWorkspace
+            try {
+                $subtitle = Join-Path $dir "Entities [entities].en.vtt"
+                Set-Content -LiteralPath $subtitle -Encoding utf8 -Value @(
+                    "WEBVTT",
+                    "",
+                    "00:00:00.000 --> 00:00:01.000",
+                    "Tom &amp; Jerry&nbsp;&quot;hi&quot;"
+                )
+
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("-CleanOnly", "-Prefer", "en")
+                Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
+
+                $txt = Join-Path $dir "texts\Entities [entities].en.txt"
+                Assert-True (Test-Path -LiteralPath $txt) "Expected text file to be created."
+                $content = Get-Content -LiteralPath $txt -Raw -Encoding utf8
+                Assert-True ($content -match 'Tom & Jerry\s+"hi"') "Expected decoded text, got: $content"
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "CleanTranscript creates editor-friendly transcript and review files"
+        Run = {
+            $dir = New-TestWorkspace
+            try {
+                $subtitle = Join-Path $dir "Transcript [transcript].ru-orig.vtt"
+                Set-Content -LiteralPath $subtitle -Encoding utf8 -Value @(
+                    "WEBVTT",
+                    "",
+                    "00:00:00.000 --> 00:00:01.000",
+                    (Utf8 @(209,141,32,209,129,208,176,208,185,209,130,32,208,190,32,208,154,208,184,209,128,208,188,209,131,209,128,208,176,209,130,208,190,208,178,208,190,208,185,32,208,180,208,181,208,187,208,176,208,187,208,184,32,208,178,32,208,160,208,181,208,180,208,184,208,188,208,176,208,179,208,190,208,188,32,208,184,32,209,132,208,184,208,179,208,188,208,176,46)),
+                    "",
+                    "00:00:01.000 --> 00:00:02.000",
+                    (Utf8 @(86,80,32,208,176,208,189,208,184,208,188,208,176,209,134,208,184,209,143,32,208,184,32,71,73,32,209,141,208,186,209,129,208,191,208,190,209,128,209,130,46,32,208,173,209,130,208,190,32,208,178,209,130,208,190,209,128,208,190,208,185,32,209,129,208,188,209,139,209,129,208,187,208,190,208,178,208,190,208,185,32,208,177,208,187,208,190,208,186,46)),
+                    "",
+                    "00:00:02.000 --> 00:00:03.000",
+                    (Utf8 @(208,148,208,176,208,187,209,140,209,136,208,181,32,208,179,208,190,208,178,208,190,209,128,208,184,208,188,32,208,191,209,128,208,190,32,208,173,208,180,208,178,209,131,208,180,32,208,184,32,208,154,208,176,209,128,208,178,208,176,209,143,46))
+                )
+
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("-CleanOnly", "-CleanTranscript", "-Prefer", "ru")
+                Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
+
+                $clean = Join-Path $dir "texts\Transcript [transcript].ru-orig.clean.txt"
+                $review = Join-Path $dir "texts\Transcript [transcript].ru-orig.review.txt"
+                Assert-True (Test-Path -LiteralPath $clean) "Expected clean transcript file to be created."
+                Assert-True (Test-Path -LiteralPath $review) "Expected review file to be created."
+
+                $content = Get-Content -LiteralPath $clean -Raw -Encoding utf8
+                Assert-True ($content -match [regex]::Escape((Utf8 @(208,154,208,184,209,128,208,181,32,208,156,209,131,209,128,208,176,209,130,208,190,208,178,208,190,208,185)))) "Expected Kire Muratovoy normalization, got: $content"
+                Assert-True ($content -match "Readymag") "Expected Readymag normalization, got: $content"
+                Assert-True ($content -match "Figma") "Expected Figma normalization, got: $content"
+                Assert-True ($content -match "WebP") "Expected WebP normalization, got: $content"
+                Assert-True ($content -match "GIF") "Expected GIF normalization, got: $content"
+                Assert-True ($content -match [regex]::Escape((Utf8 @(208,173,208,180,32,208,146,209,131,208,180)))) "Expected Ed Wood normalization, got: $content"
+                Assert-True ($content -match [regex]::Escape((Utf8 @(208,146,208,190,208,189,208,179,32,208,154,208,176,209,128,45,208,178,208,176,208,185)))) "Expected Wong Kar-wai normalization, got: $content"
+                Assert-True ($content -match "`r?`n`r?`n") "Expected paragraph breaks, got: $content"
+                $fillerPattern = '(^|\s)' + [regex]::Escape((Utf8 @(209,141))) + '(\s|$)'
+                Assert-True ($content -notmatch $fillerPattern) "Expected standalone filler to be removed, got: $content"
+
+                $reviewContent = Get-Content -LiteralPath $review -Raw -Encoding utf8
+                Assert-True ($reviewContent -match "Readymag") "Expected review checklist, got: $reviewContent"
+                Assert-True ($reviewContent -match [regex]::Escape((Utf8 @(208,154,208,184,209,128,208,176,32,208,156,209,131,209,128,208,176,209,130,208,190,208,178,208,176)))) "Expected review checklist, got: $reviewContent"
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "Existing subtitle files can be cleaned when yt-dlp leaves them unchanged"
+        Run = {
+            $dir = New-TestWorkspace
+            try {
+                $subtitle = Join-Path $dir "Existing [existing].en.vtt"
+                Set-Content -LiteralPath $subtitle -Encoding utf8 -Value @(
+                    "WEBVTT",
+                    "",
+                    "00:00:00.000 --> 00:00:01.000",
+                    "Already here"
+                )
+
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("https://example.test/existing")
+                Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
+
+                $txt = Join-Path $dir "texts\Existing [existing].en.txt"
+                Assert-True (Test-Path -LiteralPath $txt) "Expected existing subtitle to be cleaned."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "Unknown video language tries exact Russian tags before English"
+        Run = {
+            $dir = New-TestWorkspace
+            try {
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("https://example.test/unknown-language")
+                Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
+
+                $ruIndex = $result.Output.IndexOf("Trying subtitles: ru-orig")
+                $enIndex = $result.Output.IndexOf("Trying subtitles: en-orig")
+                Assert-True ($ruIndex -ge 0) "Expected Russian attempt in output: $($result.Output)"
+                Assert-True ($enIndex -lt 0 -or $ruIndex -lt $enIndex) "Expected Russian before English, got: $($result.Output)"
+                Assert-True ($result.Output -notmatch "Trying subtitles: ru\.\*") "Expected exact Russian tags instead of wildcard, got: $($result.Output)"
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "Auto mode downloads German subtitles for German videos"
+        Run = {
+            $dir = New-TestWorkspace
+            try {
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("https://example.test/german-video")
+                Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
+                Assert-True ($result.Output -match "Trying subtitles: de-orig") "Expected German attempt, got: $($result.Output)"
+
+                $txt = Join-Path $dir "texts\German [german-video].de.txt"
+                Assert-True (Test-Path -LiteralPath $txt) "Expected German subtitle text to be created."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "Prefer de downloads German subtitles explicitly"
+        Run = {
+            $dir = New-TestWorkspace
+            try {
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("https://example.test/prefer-german", "-Prefer", "de")
+                Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
+                Assert-True ($result.Output -match "Trying subtitles: de-orig") "Expected German attempt, got: $($result.Output)"
+
+                $txt = Join-Path $dir "texts\Prefer German [prefer-german].de.txt"
+                Assert-True (Test-Path -LiteralPath $txt) "Expected German subtitle text to be created."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    }
+)
+
+$failed = 0
+
+foreach ($test in $tests) {
+    try {
+        & $test.Run
+        Write-Host "PASS $($test.Name)"
+    }
+    catch {
+        $failed++
+        Write-Host "FAIL $($test.Name)"
+        Write-Host $_.Exception.Message
+    }
+}
+
+if ($failed -gt 0) {
+    throw "$failed test(s) failed."
+}

@@ -1,0 +1,8 @@
+texts/
+*.vtt
+*.srt
+*.part
+*.ytdl
+.lazyweb/
+.worktrees/
+.superpowers/
