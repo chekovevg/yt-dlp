@@ -486,6 +486,149 @@ function Format-TranscriptParagraphs {
     return ($paragraphs -join "`r`n`r`n")
 }
 
+function ConvertFrom-TranscriptUtf8Bytes {
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Bytes
+    )
+
+    return [System.Text.Encoding]::UTF8.GetString($Bytes)
+}
+
+function Get-TranscriptNormalizationTerms {
+    return @{
+        KiraMuratova = ConvertFrom-TranscriptUtf8Bytes @(208,154,208,184,209,128,208,176,32,208,156,209,131,209,128,208,176,209,130,208,190,208,178,208,176)
+        KireMuratovoy = ConvertFrom-TranscriptUtf8Bytes @(208,154,208,184,209,128,208,181,32,208,156,209,131,209,128,208,176,209,130,208,190,208,178,208,190,208,185)
+        KirMuratovoyBad = ConvertFrom-TranscriptUtf8Bytes @(208,186,208,184,209,128,208,188,209,131,209,128,208,176,209,130,208,190,208,178,208,190,208,185)
+        Kir = ConvertFrom-TranscriptUtf8Bytes @(208,186,208,184,209,128)
+        Murat = ConvertFrom-TranscriptUtf8Bytes @(208,188,209,131,209,128,208,176,209,130)
+        MuratovoySuffix = ConvertFrom-TranscriptUtf8Bytes @(208,190,208,178,208,190,208,185)
+        Redimag = ConvertFrom-TranscriptUtf8Bytes @(209,128,208,181,208,180,208,184,208,188,208,176,208,179)
+        FigmaStem = ConvertFrom-TranscriptUtf8Bytes @(209,132,208,184,208,179,208,188)
+        EdWood = ConvertFrom-TranscriptUtf8Bytes @(208,173,208,180,32,208,146,209,131,208,180)
+        EdwoodBad = ConvertFrom-TranscriptUtf8Bytes @(209,141,208,180,208,178,209,131,208,180)
+        Karvaya = ConvertFrom-TranscriptUtf8Bytes @(208,186,208,176,209,128,208,178,208,176,209,143)
+        WongKarWai = ConvertFrom-TranscriptUtf8Bytes @(208,146,208,190,208,189,208,179,32,208,154,208,176,209,128,45,208,178,208,176,208,185)
+        FillerE = ConvertFrom-TranscriptUtf8Bytes @(209,141)
+        FillerA = ConvertFrom-TranscriptUtf8Bytes @(208,176)
+        FillerM = ConvertFrom-TranscriptUtf8Bytes @(208,188)
+    }
+}
+
+function Normalize-TranscriptLine {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Line
+    )
+
+    $terms = Get-TranscriptNormalizationTerms
+    $line = $Line
+    $fillers = @(
+        [regex]::Escape($terms.FillerE),
+        [regex]::Escape($terms.FillerA),
+        [regex]::Escape($terms.FillerM),
+        "uh",
+        "um"
+    ) -join "|"
+
+    $line = $line -replace "(?i)^\s*($fillers)+\s+", ""
+
+    $kir = [regex]::Escape($terms.Kir)
+    $murat = [regex]::Escape($terms.Murat)
+    $muratovoySuffix = [regex]::Escape($terms.MuratovoySuffix)
+    $kirMuratovoyBad = [regex]::Escape($terms.KirMuratovoyBad)
+    $line = $line -replace "(?i)\b$kirMuratovoyBad\b", $terms.KireMuratovoy
+    $line = $line -replace "(?i)\b($kir\s*$murat\w*|$kir$murat\w*)$muratovoySuffix\b", $terms.KireMuratovoy
+    $line = $line -replace "(?i)\b($kir\s*$murat\w*|$kir$murat\w*)\b", $terms.KiraMuratova
+
+    $redimag = [regex]::Escape($terms.Redimag)
+    $line = $line -replace "(?i)\b(readymag|ready\s*mag|redimag\w*|$redimag\w*)\b", "Readymag"
+
+    $figmaStem = [regex]::Escape($terms.FigmaStem)
+    $line = $line -replace "(?i)\b(figma|figm\w*|$figmaStem\w*)\b", "Figma"
+
+    $line = $line -replace "(?i)\b(webp|web\s*p|webpay|vp)\b", "WebP"
+    $line = $line -replace "(?i)\b(gif|gi|gv)\b", "GIF"
+
+    $edwoodBad = [regex]::Escape($terms.EdwoodBad)
+    $line = $line -replace "(?i)\b(ed\s*wood|edwood|$edwoodBad)\b", $terms.EdWood
+
+    $karvaya = [regex]::Escape($terms.Karvaya)
+    $line = $line -replace "(?i)\b(wong\s*kar\s*wai|karvaya|$karvaya)\b", $terms.WongKarWai
+
+    $line = $line -replace '\s{2,}', ' '
+    return $line.Trim()
+}
+
+function Format-CleanTranscriptText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Text
+    )
+
+    $sentences = [regex]::Split($Text.Trim(), '(?<=[.!?])\s+') |
+        Where-Object { $_.Trim() }
+    $paragraphs = New-Object System.Collections.Generic.List[string]
+    $current = ""
+    $sentenceCount = 0
+
+    foreach ($sentence in $sentences) {
+        $sentence = $sentence.Trim()
+
+        if (-not $current) {
+            $current = $sentence
+            $sentenceCount = 1
+            continue
+        }
+
+        if (($current.Length + $sentence.Length) -gt 520 -or $sentenceCount -ge 3) {
+            $paragraphs.Add($current)
+            $current = $sentence
+            $sentenceCount = 1
+        }
+        else {
+            $current = "$current $sentence"
+            $sentenceCount++
+        }
+    }
+
+    if ($current) {
+        $paragraphs.Add($current)
+    }
+
+    return ($paragraphs -join "`r`n`r`n")
+}
+
+function Write-TranscriptReviewFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$CleanPath
+    )
+
+    $terms = Get-TranscriptNormalizationTerms
+    $lines = @(
+        "Review checklist",
+        "",
+        "Clean transcript: $CleanPath",
+        "",
+        "Check names and terms manually:",
+        "- $($terms.KiraMuratova)",
+        "- Readymag",
+        "- Figma",
+        "- WebP",
+        "- GIF",
+        "- $($terms.EdWood)",
+        "- $($terms.WongKarWai)",
+        "",
+        "This file is a deterministic cleanup aid, not a verified transcript."
+    )
+
+    Set-Content -LiteralPath $Path -Value $lines -Encoding utf8
+}
+
 function Convert-SubtitleFileToTranscriptText {
     param(
         [Parameter(Mandatory = $true)]
@@ -548,9 +691,14 @@ function Convert-SubtitleFileToTranscriptText {
 
         $line = $rawLine -replace '<[^>]+>', ''
         $line = [System.Net.WebUtility]::HtmlDecode($line)
+        $line = $line -replace '>>', ''
         $line = $line -replace ([char]0x00A0), ' '
         $line = $line -replace '\[.*?\]', ''
         $line = $line.Trim()
+
+        if ($TranscriptMode) {
+            $line = Normalize-TranscriptLine -Line $line
+        }
 
         if ($line -and $line -ne $prev) {
             $prev = $line
@@ -569,8 +717,364 @@ function Convert-SubtitleFileToTranscriptText {
         throw "Subtitle file did not contain readable transcript text."
     }
 
+    if ($TranscriptMode) {
+        return Format-CleanTranscriptText -Text $text
+    }
+
     $sentences = @([regex]::Split($text, '(?<=[.!?])\s+') | Where-Object { $_.Trim() })
     return Format-TranscriptParagraphs -Sentences $sentences
+}
+
+function Save-TranscriptFromSubtitleFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputDir,
+
+        [bool]$CleanTranscript
+    )
+
+    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+
+    $sourceName = Split-Path -Leaf $Path
+    $textName = if ($CleanTranscript) {
+        [System.IO.Path]::ChangeExtension($sourceName, ".clean.txt")
+    }
+    else {
+        [System.IO.Path]::ChangeExtension($sourceName, ".txt")
+    }
+
+    $textPath = Join-Path $OutputDir $textName
+    $text = Convert-SubtitleFileToTranscriptText -Path $Path -TranscriptMode:$CleanTranscript
+    Set-Content -LiteralPath $textPath -Value $text -Encoding utf8
+
+    $reviewPath = $null
+    if ($CleanTranscript) {
+        $reviewName = [System.IO.Path]::ChangeExtension($sourceName, ".review.txt")
+        $reviewPath = Join-Path $OutputDir $reviewName
+        Write-TranscriptReviewFile -Path $reviewPath -CleanPath $textPath
+    }
+
+    return [pscustomobject]@{
+        TextPath = $textPath
+        ReviewPath = $reviewPath
+    }
+}
+
+function Get-CliSubtitleLanguageTags {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("ru", "en", "de")]
+        [string]$Language
+    )
+
+    if ($Language -eq "ru") {
+        return @("ru-orig", "ru")
+    }
+
+    if ($Language -eq "en") {
+        return @("en-orig", "en", "en-GB", "en-US")
+    }
+
+    return @("de-orig", "de")
+}
+
+function Resolve-CliPreferredLanguage {
+    param(
+        [AllowNull()]
+        [string]$Language
+    )
+
+    if ($Language -match '^ru') {
+        return "ru"
+    }
+
+    if ($Language -match '^en') {
+        return "en"
+    }
+
+    if ($Language -match '^de') {
+        return "de"
+    }
+
+    return $null
+}
+
+function Get-CliVideoLanguage {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$YtDlpPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Url
+    )
+
+    try {
+        $result = Invoke-TranscriptProcess -FilePath $YtDlpPath -ArgumentList @(
+            "--skip-download", "--print", "%(language)s", $Url
+        )
+
+        if ($result.ExitCode -eq 0) {
+            $language = @($result.StdOut -split '[\r\n]+' | Where-Object { $_ } | Select-Object -First 1)[0]
+            if ($language -and $language -ne "NA") {
+                return $language.Trim().ToLowerInvariant()
+            }
+        }
+    }
+    catch {
+        return $null
+    }
+
+    return $null
+}
+
+function Get-CliSubtitleLanguagePlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Preference,
+
+        [string]$SubtitleLanguages,
+
+        [Parameter(Mandatory = $true)]
+        [string]$YtDlpPath
+    )
+
+    if ($SubtitleLanguages) {
+        $preferred = if ($Preference -ne "auto") { $Preference } else { $null }
+        return [pscustomobject]@{
+            Attempts = @($SubtitleLanguages)
+            PreferredLanguage = $preferred
+        }
+    }
+
+    if ($Preference -ne "auto") {
+        return [pscustomobject]@{
+            Attempts = @(Get-CliSubtitleLanguageTags -Language $Preference)
+            PreferredLanguage = $Preference
+        }
+    }
+
+    $detected = Resolve-CliPreferredLanguage -Language (Get-CliVideoLanguage -YtDlpPath $YtDlpPath -Url $Url)
+    $languages = New-Object System.Collections.Generic.List[string]
+    if ($detected) {
+        $languages.Add($detected)
+    }
+
+    foreach ($fallback in @("ru", "en", "de")) {
+        if (-not $languages.Contains($fallback)) {
+            $languages.Add($fallback)
+        }
+    }
+
+    $attempts = @(
+        foreach ($language in $languages) {
+            Get-CliSubtitleLanguageTags -Language $language
+        }
+    )
+
+    return [pscustomobject]@{
+        Attempts = $attempts
+        PreferredLanguage = $detected
+    }
+}
+
+function Get-CliSubtitlePriority {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo]$File,
+
+        [AllowNull()]
+        [string]$PreferredLanguage
+    )
+
+    $name = $File.Name.ToLowerInvariant()
+    $priority = if ($PreferredLanguage -eq "en") {
+        @("en-orig", "en", "ru", "ru-orig", "de-orig", "de")
+    }
+    elseif ($PreferredLanguage -eq "ru") {
+        @("ru-orig", "ru", "en", "en-orig", "de-orig", "de")
+    }
+    elseif ($PreferredLanguage -eq "de") {
+        @("de-orig", "de", "en", "en-orig", "ru", "ru-orig")
+    }
+    else {
+        @("ru-orig", "ru", "en-orig", "en", "de-orig", "de")
+    }
+
+    for ($i = 0; $i -lt $priority.Count; $i++) {
+        $tag = [regex]::Escape($priority[$i])
+        if ($name -match "\.$tag\.(vtt|srt)$") {
+            return $i
+        }
+    }
+
+    return 9
+}
+
+function Select-CliPreferredSubtitleFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo[]]$Subtitles,
+
+        [AllowNull()]
+        [string]$PreferredLanguage
+    )
+
+    return $Subtitles |
+        Sort-Object `
+            @{ Expression = { Get-CliSubtitlePriority -File $_ -PreferredLanguage $PreferredLanguage }; Ascending = $true },
+            @{ Expression = { $_.LastWriteTimeUtc }; Descending = $true } |
+        Select-Object -First 1
+}
+
+function Save-TranscriptFromYoutubeCli {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputDir,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Preference,
+
+        [string]$SubtitleLanguages,
+
+        [bool]$NoClean,
+
+        [bool]$KeepSubtitles,
+
+        [bool]$Srt,
+
+        [bool]$CleanTranscript,
+
+        [string]$YtDlpPath,
+
+        [scriptblock]$OnAttempt
+    )
+
+    $tool = Get-YtDlpPath -PreferredPath $YtDlpPath
+    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+
+    $plan = Get-CliSubtitleLanguagePlan `
+        -Url $Url `
+        -Preference $Preference `
+        -SubtitleLanguages $SubtitleLanguages `
+        -YtDlpPath $tool
+
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("youtube-transcript-cli-" + [System.Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+
+    $downloadedSubtitles = @()
+    $lastExitCode = 0
+
+    try {
+        for ($attemptIndex = 0; $attemptIndex -lt $plan.Attempts.Count; $attemptIndex++) {
+            $subtitleLanguages = $plan.Attempts[$attemptIndex]
+            $attemptDir = Join-Path $tempDir ("attempt-{0:D2}" -f $attemptIndex)
+            New-Item -ItemType Directory -Path $attemptDir -Force | Out-Null
+
+            if ($OnAttempt) {
+                & $OnAttempt $subtitleLanguages
+            }
+
+            $arguments = @(
+                "--skip-download",
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-langs", $subtitleLanguages
+            )
+
+            if ($Srt) {
+                $arguments += @("--sub-format", "srt/best", "--convert-subs", "srt")
+            }
+            else {
+                $arguments += @("--sub-format", "vtt/best")
+            }
+
+            $arguments += @(
+                "-o", (Join-Path $attemptDir "%(title)s [%(id)s].%(ext)s"),
+                $Url
+            )
+
+            $downloadResult = Invoke-TranscriptProcess `
+                -FilePath $tool `
+                -ArgumentList $arguments `
+                -WorkingDirectory $attemptDir
+            $lastExitCode = $downloadResult.ExitCode
+            $downloadedSubtitles = @(Get-ChildItem -LiteralPath $attemptDir -File |
+                Where-Object { $_.Extension -in ".vtt", ".srt" })
+
+            if ($downloadedSubtitles.Count -gt 0) {
+                break
+            }
+        }
+
+        if ($downloadedSubtitles.Count -eq 0) {
+            return [pscustomobject]@{
+                TextPath = $null
+                ReviewPath = $null
+                SubtitlePaths = @()
+                OutputDir = $OutputDir
+                FoundSubtitles = $false
+                ExitCode = if ($NoClean) { $lastExitCode } else { 1 }
+                YtDlpExitCode = $lastExitCode
+            }
+        }
+
+        if ($NoClean) {
+            $subtitlePaths = @(
+                foreach ($subtitle in $downloadedSubtitles) {
+                    $destination = Join-Path $OutputDir $subtitle.Name
+                    Copy-Item -LiteralPath $subtitle.FullName -Destination $destination -Force
+                    $destination
+                }
+            )
+
+            return [pscustomobject]@{
+                TextPath = $null
+                ReviewPath = $null
+                SubtitlePaths = $subtitlePaths
+                OutputDir = $OutputDir
+                FoundSubtitles = $true
+                ExitCode = 0
+                YtDlpExitCode = $lastExitCode
+            }
+        }
+
+        $selected = Select-CliPreferredSubtitleFile `
+            -Subtitles $downloadedSubtitles `
+            -PreferredLanguage $plan.PreferredLanguage
+        $saved = Save-TranscriptFromSubtitleFile `
+            -Path $selected.FullName `
+            -OutputDir $OutputDir `
+            -CleanTranscript $CleanTranscript
+        $subtitlePaths = @()
+
+        if ($KeepSubtitles) {
+            $destination = Join-Path $OutputDir $selected.Name
+            Copy-Item -LiteralPath $selected.FullName -Destination $destination -Force
+            $subtitlePaths = @($destination)
+        }
+
+        return [pscustomobject]@{
+            TextPath = $saved.TextPath
+            ReviewPath = $saved.ReviewPath
+            SubtitlePaths = $subtitlePaths
+            OutputDir = $OutputDir
+            FoundSubtitles = $true
+            ExitCode = 0
+            YtDlpExitCode = $lastExitCode
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Save-TranscriptFromYoutube {
@@ -713,5 +1217,7 @@ Export-ModuleMember -Function @(
     "Resolve-TranscriptSubtitleChoice",
     "New-TranscriptFileName",
     "Convert-SubtitleFileToTranscriptText",
+    "Save-TranscriptFromSubtitleFile",
+    "Save-TranscriptFromYoutubeCli",
     "Save-TranscriptFromYoutube"
 )

@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $scriptUnderTest = Join-Path $repoRoot "download-subs.ps1"
+$moduleUnderTest = Join-Path $repoRoot "transcript-tool.psm1"
 
 function New-FakeExe {
     param(
@@ -19,6 +20,7 @@ function New-TestWorkspace {
     $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("download-subs-tests-" + [System.Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     Copy-Item -LiteralPath $scriptUnderTest -Destination (Join-Path $dir "download-subs.ps1")
+    Copy-Item -LiteralPath $moduleUnderTest -Destination (Join-Path $dir "transcript-tool.psm1")
 
     $ytDlpSource = @'
 using System;
@@ -27,6 +29,25 @@ using System.Linq;
 using System.Text;
 
 public class Program {
+    private static string GetOutputDirectory(string[] args) {
+        var outputIndex = Array.IndexOf(args, "-o");
+        if (outputIndex < 0 || outputIndex + 1 >= args.Length) {
+            return null;
+        }
+
+        return Path.GetDirectoryName(Path.GetFullPath(args[outputIndex + 1]));
+    }
+
+    private static void WriteSubtitle(string[] args, string name, string content) {
+        var directory = GetOutputDirectory(args);
+        if (directory == null) {
+            return;
+        }
+
+        Directory.CreateDirectory(directory);
+        File.WriteAllText(Path.Combine(directory, name), content, new UTF8Encoding(false));
+    }
+
     public static int Main(string[] args) {
         if (args.Contains("--print")) {
             var printUrl = args.Length == 0 ? "" : args[args.Length - 1];
@@ -56,10 +77,10 @@ public class Program {
         }
 
         if (url.Contains("fresh")) {
-            File.WriteAllText(
-                Path.Combine(Environment.CurrentDirectory, "Fresh [fresh].en.vtt"),
-                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nFresh &amp; clean\n",
-                new UTF8Encoding(false));
+            WriteSubtitle(
+                args,
+                "Fresh [fresh].en.vtt",
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nFresh &amp; clean\n");
             return 0;
         }
 
@@ -68,10 +89,10 @@ public class Program {
             var requestedLangs = langIndex >= 0 && langIndex + 1 < args.Length ? args[langIndex + 1] : "";
 
             if (requestedLangs == "ru-orig" || requestedLangs == "ru") {
-                File.WriteAllText(
-                    Path.Combine(Environment.CurrentDirectory, "Unknown [unknown-language].ru.vtt"),
-                    "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nRussian first\n",
-                    new UTF8Encoding(false));
+                WriteSubtitle(
+                    args,
+                    "Unknown [unknown-language].ru.vtt",
+                    "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nRussian first\n");
             }
 
             return 0;
@@ -82,10 +103,10 @@ public class Program {
             var requestedLangs = langIndex >= 0 && langIndex + 1 < args.Length ? args[langIndex + 1] : "";
 
             if (requestedLangs == "de-orig" || requestedLangs == "de") {
-                File.WriteAllText(
-                    Path.Combine(Environment.CurrentDirectory, "German [german-video].de.vtt"),
-                    "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nGuten Tag\n",
-                    new UTF8Encoding(false));
+                WriteSubtitle(
+                    args,
+                    "German [german-video].de.vtt",
+                    "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nGuten Tag\n");
             }
 
             return 0;
@@ -96,10 +117,10 @@ public class Program {
             var requestedLangs = langIndex >= 0 && langIndex + 1 < args.Length ? args[langIndex + 1] : "";
 
             if (requestedLangs == "de-orig" || requestedLangs == "de") {
-                File.WriteAllText(
-                    Path.Combine(Environment.CurrentDirectory, "Prefer German [prefer-german].de.vtt"),
-                    "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nNur Deutsch\n",
-                    new UTF8Encoding(false));
+                WriteSubtitle(
+                    args,
+                    "Prefer German [prefer-german].de.vtt",
+                    "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nNur Deutsch\n");
             }
 
             return 0;
@@ -130,12 +151,18 @@ function Invoke-DownloadSubs {
         [string]$Directory,
 
         [Parameter(Mandatory = $true)]
-        [string[]]$Arguments
+        [string[]]$Arguments,
+
+        [string]$WorkingDirectory
     )
+
+    if (-not $WorkingDirectory) {
+        $WorkingDirectory = $Directory
+    }
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = "powershell.exe"
-    $psi.WorkingDirectory = $Directory
+    $psi.WorkingDirectory = $WorkingDirectory
     $escapedArgs = $Arguments | ForEach-Object {
         if ($_ -match '[\s"]') {
             '"' + ($_ -replace '"', '\"') + '"'
@@ -232,6 +259,31 @@ $tests = @(
         }
     },
     @{
+        Name = "CleanOnly creates text without deleting its subtitle source"
+        Run = {
+            $dir = New-TestWorkspace
+            try {
+                $subtitle = Join-Path $dir "Preserved [preserved].en.vtt"
+                Set-Content -LiteralPath $subtitle -Encoding utf8 -Value @(
+                    "WEBVTT",
+                    "",
+                    "00:00:00.000 --> 00:00:01.000",
+                    "Keep this source"
+                )
+
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("-CleanOnly", "-Prefer", "en")
+                Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
+                Assert-True (Test-Path -LiteralPath $subtitle) "Expected CleanOnly to preserve its subtitle source."
+
+                $txt = Join-Path $dir "texts\Preserved [preserved].en.txt"
+                Assert-True (Test-Path -LiteralPath $txt) "Expected text file to be created."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
         Name = "CleanTranscript creates editor-friendly transcript and review files"
         Run = {
             $dir = New-TestWorkspace
@@ -280,26 +332,64 @@ $tests = @(
         }
     },
     @{
-        Name = "Existing subtitle files can be cleaned when yt-dlp leaves them unchanged"
+        Name = "Online download preserves unrelated subtitles and converts only fresh output"
         Run = {
             $dir = New-TestWorkspace
             try {
-                $subtitle = Join-Path $dir "Existing [existing].en.vtt"
-                Set-Content -LiteralPath $subtitle -Encoding utf8 -Value @(
+                $first = Join-Path $dir "Unrelated First [old-1].en.vtt"
+                $second = Join-Path $dir "Unrelated Second [old-2].en.vtt"
+                Set-Content -LiteralPath $first -Encoding utf8 -Value @(
                     "WEBVTT",
                     "",
                     "00:00:00.000 --> 00:00:01.000",
-                    "Already here"
+                    "Old first"
                 )
+                Set-Content -LiteralPath $second -Encoding utf8 -Value @(
+                    "WEBVTT",
+                    "",
+                    "00:00:00.000 --> 00:00:01.000",
+                    "Old second"
+                )
+                (Get-Item -LiteralPath $first).LastWriteTimeUtc = [datetime]::UtcNow.AddMinutes(-2)
+                (Get-Item -LiteralPath $second).LastWriteTimeUtc = [datetime]::UtcNow.AddMinutes(-1)
 
-                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("https://example.test/existing")
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("https://example.test/fresh", "-Prefer", "en")
                 Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
+                Assert-True (Test-Path -LiteralPath $first) "Expected first unrelated subtitle to remain present."
+                Assert-True (Test-Path -LiteralPath $second) "Expected second unrelated subtitle to remain present."
 
-                $txt = Join-Path $dir "texts\Existing [existing].en.txt"
-                Assert-True (Test-Path -LiteralPath $txt) "Expected existing subtitle to be cleaned."
+                $freshText = Join-Path $dir "texts\Fresh [fresh].en.txt"
+                Assert-True (Test-Path -LiteralPath $freshText) "Expected only the fresh subtitle to be converted."
+                Assert-True (-not (Test-Path -LiteralPath (Join-Path $dir "texts\Unrelated First [old-1].en.txt"))) "Unexpected conversion of first unrelated subtitle."
+                Assert-True (-not (Test-Path -LiteralPath (Join-Path $dir "texts\Unrelated Second [old-2].en.txt"))) "Unexpected conversion of second unrelated subtitle."
             }
             finally {
                 Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "Online download honors OutputDir when process working directory differs"
+        Run = {
+            $dir = New-TestWorkspace
+            $workingDir = Join-Path ([System.IO.Path]::GetTempPath()) ("download-subs-cwd-" + [System.Guid]::NewGuid().ToString("N"))
+            $outputDir = Join-Path ([System.IO.Path]::GetTempPath()) ("download-subs-output-" + [System.Guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $workingDir -Force | Out-Null
+
+            try {
+                $result = Invoke-DownloadSubs `
+                    -Directory $dir `
+                    -WorkingDirectory $workingDir `
+                    -Arguments @("https://example.test/fresh", "-Prefer", "en", "-OutputDir", $outputDir)
+
+                Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
+                $txt = Join-Path $outputDir "Fresh [fresh].en.txt"
+                Assert-True (Test-Path -LiteralPath $txt) "Expected text in the requested output directory."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+                Remove-Item -LiteralPath $workingDir -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $outputDir -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
     },
