@@ -858,6 +858,106 @@ $tests = @(
         }
     },
     @{
+        Name = "Clean worker process runs yt-dlp from a PowerShell background job"
+        Run = {
+            $realYtDlpPath = Join-Path $repoRoot "yt-dlp.exe"
+            $probeScriptPath = Join-Path $fakeRoot "clean-worker-probe.ps1"
+            $job = $null
+
+            Assert-True (Test-Path -LiteralPath $realYtDlpPath -PathType Leaf) "The yt-dlp executable is required for the clean-worker regression test."
+
+            $probeSource = @'
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$ModulePath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$YtDlpPath
+)
+
+$ErrorActionPreference = "Stop"
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
+
+try {
+    Import-Module $ModulePath -Force
+    $probe = Invoke-TranscriptProcess `
+        -FilePath $YtDlpPath `
+        -ArgumentList @("--version") `
+        -TimeoutMilliseconds 8000
+
+    if ($probe.TimedOut) {
+        throw "yt-dlp version probe timed out."
+    }
+    if ($probe.ExitCode -ne 0 -or -not ([string]$probe.StdOut).Trim()) {
+        throw "yt-dlp version probe failed: $($probe.Output)"
+    }
+
+    $version = ([string]$probe.StdOut).Trim()
+
+    $json = [pscustomobject]@{ Kind = "Result"; Value = $version.Trim() } |
+        ConvertTo-Json -Compress
+    [Console]::Out.WriteLine(
+        "TT1:" + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
+    )
+}
+catch {
+    $json = [pscustomobject]@{ Kind = "Error"; Value = $_.Exception.Message } |
+        ConvertTo-Json -Compress
+    [Console]::Out.WriteLine(
+        "TT1:" + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
+    )
+    exit 1
+}
+'@
+            [System.IO.File]::WriteAllText(
+                $probeScriptPath,
+                $probeSource,
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+
+            try {
+                $job = Start-Job `
+                    -ArgumentList @($modulePath, $probeScriptPath, $realYtDlpPath) `
+                    -ScriptBlock {
+                        param($module, $probeScript, $ytDlp)
+                        $ErrorActionPreference = "Stop"
+                        Import-Module $module -Force
+                        Invoke-TranscriptWorkerProcess `
+                            -WorkerScriptPath $probeScript `
+                            -ArgumentList @(
+                                "-ModulePath", $module,
+                                "-YtDlpPath", $ytDlp
+                            )
+                    }
+
+                $completed = Wait-Job -Job $job -Timeout 15
+                $receivedErrors = @()
+                $messages = @(Receive-Job `
+                    -Job $job `
+                    -Keep `
+                    -ErrorAction SilentlyContinue `
+                    -ErrorVariable +receivedErrors)
+
+                Assert-True ([bool]$completed) "The clean worker did not complete within 15 seconds."
+                Assert-True ($job.State -eq "Completed") "The clean worker job failed: $((@($receivedErrors | ForEach-Object { $_.Exception.Message }) -join ' | '))"
+
+                $result = $messages | Where-Object { [string]$_.Kind -eq "Result" } | Select-Object -Last 1
+                Assert-True ([bool]$result) "The clean worker did not return a result message."
+                Assert-True ([string]$result.Value -match '^\d{4}\.\d{2}\.\d{2}') "Unexpected yt-dlp version: $($result.Value)"
+            }
+            finally {
+                if ($job) {
+                    if ($job.State -notin "Completed", "Failed", "Stopped") {
+                        Stop-Job -Job $job -ErrorAction SilentlyContinue
+                    }
+                    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    },
+    @{
         Name = "CLI core returns one public result when attempt callback writes output"
         Run = {
             $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-cli-result-tests-" + [System.Guid]::NewGuid().ToString("N"))

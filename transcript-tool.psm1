@@ -394,6 +394,91 @@ function Invoke-TranscriptProcess {
     }
 }
 
+function Invoke-TranscriptWorkerProcess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$WorkerScriptPath,
+
+        [string[]]$ArgumentList = @()
+    )
+
+    if (-not (Test-Path -LiteralPath $WorkerScriptPath -PathType Leaf)) {
+        throw "Transcript worker script was not found: $WorkerScriptPath"
+    }
+
+    $powershellPath = Join-Path $PSHOME "powershell.exe"
+    $workerArguments = @(
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        $WorkerScriptPath
+    ) + @($ArgumentList)
+
+    $reportedError = $null
+    $unparsedOutput = New-Object System.Collections.Generic.List[string]
+
+    & $powershellPath @workerArguments 2>&1 |
+        ForEach-Object {
+            $line = [string]$_
+            if ([string]::IsNullOrWhiteSpace($line)) {
+                return
+            }
+
+            try {
+                if (-not $line.StartsWith("TT1:", [System.StringComparison]::Ordinal)) {
+                    throw "Missing transcript-worker protocol prefix."
+                }
+
+                $json = [System.Text.Encoding]::UTF8.GetString(
+                    [Convert]::FromBase64String($line.Substring(4))
+                )
+                $message = $json | ConvertFrom-Json -ErrorAction Stop
+            }
+            catch {
+                if ($unparsedOutput.Count -lt 20) {
+                    $unparsedOutput.Add($line)
+                }
+                continue
+            }
+
+            switch ([string]$message.Kind) {
+                "Status" { $message }
+                "Result" { $message }
+                "Error" {
+                    if (-not $reportedError) {
+                        $reportedError = [string]$message.Value
+                    }
+                }
+                default {
+                    if ($unparsedOutput.Count -lt 20) {
+                        $unparsedOutput.Add($line)
+                    }
+                }
+            }
+        }
+
+    $exitCode = $LASTEXITCODE
+
+    if ($reportedError) {
+        throw $reportedError
+    }
+
+    if ($exitCode -ne 0 -or $unparsedOutput.Count -gt 0) {
+        $diagnostic = Get-BoundedTranscriptDiagnostic -Text (
+            @($unparsedOutput) -join [System.Environment]::NewLine
+        )
+
+        if (-not $diagnostic) {
+            $diagnostic = "exit code $exitCode"
+        }
+
+        throw "Transcript worker failed: $diagnostic"
+    }
+}
+
 function Invoke-YtDlpJson {
     param(
         [Parameter(Mandatory = $true)]
@@ -1853,6 +1938,7 @@ Export-ModuleMember -Function @(
     "Get-YtDlpPath",
     "Test-YoutubeUrl",
     "Invoke-TranscriptProcess",
+    "Invoke-TranscriptWorkerProcess",
     "Invoke-YtDlpJson",
     "Get-AvailableTranscriptLanguages",
     "Resolve-TranscriptSubtitleChoice",

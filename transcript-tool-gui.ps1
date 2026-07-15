@@ -409,6 +409,7 @@ $saveButton.Add_Click({
         Write-TranscriptSettings -OutputDir $outputDir -Language $language -KeepSubtitles:$keepSubtitles
 
         $modulePath = Join-Path $root "transcript-tool.psm1"
+        $workerScriptPath = Join-Path $root "transcript-worker.ps1"
         $script:activeResult = $null
         $script:activeError = $null
         $script:activeWorkerIdentity = $null
@@ -433,6 +434,7 @@ $saveButton.Add_Click({
         $script:activeJob = Start-Job `
             -ArgumentList @(
                 $modulePath,
+                $workerScriptPath,
                 $url,
                 $outputDir,
                 $language,
@@ -444,6 +446,7 @@ $saveButton.Add_Click({
             -ScriptBlock {
                 param(
                     $modulePath,
+                    $workerScriptPath,
                     $url,
                     $outputDir,
                     $language,
@@ -479,30 +482,15 @@ $saveButton.Add_Click({
 
                 Import-Module $modulePath -Force
 
-                Save-TranscriptFromYoutube `
-                    -Url $url `
-                    -OutputDir $outputDir `
-                    -Language $language `
-                    -KeepSubtitles:$keepSubtitles `
-                    -OperationId $operationId `
-                    -OnStatus {
-                        param($status)
-                        [pscustomobject]@{
-                            Kind = "Status"
-                            Value = $status
-                        }
-                    } |
-                    ForEach-Object {
-                        if ([string]$_.Kind -eq "Status") {
-                            $_
-                        }
-                        else {
-                            [pscustomobject]@{
-                                Kind = "Result"
-                                Value = $_
-                            }
-                        }
-                    }
+                Invoke-TranscriptWorkerProcess `
+                    -WorkerScriptPath $workerScriptPath `
+                    -ArgumentList @(
+                        "-Url", $url,
+                        "-OutputDir", $outputDir,
+                        "-Language", $language,
+                        "-KeepSubtitles", $(if ($keepSubtitles) { "1" } else { "0" }),
+                        "-OperationId", $operationId
+                    )
                 }
 
         $jobTimer.Start()
