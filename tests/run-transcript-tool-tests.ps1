@@ -13,13 +13,41 @@ function New-FakeYtDlp {
 
     $source = @'
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 
 public class Program {
+    private static int HangWithChild(string markerPath) {
+        var child = Process.Start(new ProcessStartInfo {
+            FileName = Process.GetCurrentProcess().MainModule.FileName,
+            Arguments = "--hang-child",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden
+        });
+        File.AppendAllLines(markerPath, new[] {
+            Process.GetCurrentProcess().Id.ToString(),
+            child.Id.ToString()
+        });
+        Console.WriteLine("hang fixture started");
+        Console.Out.Flush();
+        child.WaitForExit();
+        return child.ExitCode;
+    }
+
     public static int Main(string[] args) {
         var url = args.Length == 0 ? "" : args[args.Length - 1];
+        if (args.Contains("--hang-child")) {
+            Thread.Sleep(Timeout.Infinite);
+            return 0;
+        }
+        var hangIndex = Array.IndexOf(args, "--hang-with-child");
+        if (hangIndex >= 0) {
+            return HangWithChild(args[hangIndex + 1]);
+        }
         if (args.Contains("--echo-args")) {
             foreach (var argument in args.SkipWhile(value => value != "--echo-args").Skip(1)) {
                 Console.WriteLine(argument.Length + ":" + Convert.ToBase64String(Encoding.UTF8.GetBytes(argument)));
@@ -33,6 +61,16 @@ public class Program {
         if (url.Contains("metadata-long")) {
             Console.Error.WriteLine("ERROR: " + new string('m', 3000) + " TAIL-METADATA-DIAGNOSTIC");
             return 9;
+        }
+        if (url.Contains("metadata-hang-once")) {
+            var statePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "metadata-hang-once.flag");
+            if (!File.Exists(statePath)) {
+                File.WriteAllText(statePath, "first attempt started");
+                return HangWithChild(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "metadata-hang-once-pids.txt"));
+            }
+        }
+        if (url.Contains("metadata-hang-always")) {
+            return HangWithChild(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "metadata-hang-always-pids.txt"));
         }
         if (url.Contains("cli-failure")) {
             Console.Error.WriteLine("ERROR: " + new string('x', 3000) + " TAIL-CLI-DIAGNOSTIC");
@@ -793,6 +831,33 @@ $tests = @(
         }
     },
     @{
+        Name = "Native invocation times out and terminates its process tree"
+        Run = {
+            $markerPath = Join-Path $fakeRoot ("hung-processes-" + [Guid]::NewGuid().ToString("N") + ".txt")
+            $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+            try {
+                $result = Invoke-TranscriptProcess `
+                    -FilePath $fakeYtDlpPath `
+                    -ArgumentList @("--hang-with-child", $markerPath) `
+                    -TimeoutMilliseconds 300
+                $stopwatch.Stop()
+
+                Assert-True $result.TimedOut "Expected the hung native process to report a timeout."
+                Assert-True ($stopwatch.ElapsedMilliseconds -lt 5000) "Hung native cleanup took $($stopwatch.ElapsedMilliseconds) ms."
+                Assert-True (Test-Path -LiteralPath $markerPath) "Hung native fixture did not publish its process IDs."
+
+                $processIds = @(Get-Content -LiteralPath $markerPath | ForEach-Object { [int]$_ })
+                Assert-True ($processIds.Count -eq 2) "Expected parent and child process IDs from the hung fixture."
+                foreach ($processId in $processIds) {
+                    Assert-True (-not (Get-Process -Id $processId -ErrorAction SilentlyContinue)) "Timed-out native process $processId survived cleanup."
+                }
+            }
+            finally {
+                Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
         Name = "CLI core returns one public result when attempt callback writes output"
         Run = {
             $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-cli-result-tests-" + [System.Guid]::NewGuid().ToString("N"))
@@ -906,6 +971,65 @@ $tests = @(
         Run = {
             $info = Invoke-YtDlpJson -YtDlpPath $fakeYtDlpPath -Url "https://youtube.com/watch?v=working"
             Assert-True ($info.id -eq "abc123") "Expected abc123, got $($info.id)"
+        }
+    },
+    @{
+        Name = "Metadata timeout is cleaned up and retried once"
+        Run = {
+            $statePath = Join-Path $fakeRoot "metadata-hang-once.flag"
+            $markerPath = Join-Path $fakeRoot "metadata-hang-once-pids.txt"
+            Remove-Item -LiteralPath $statePath, $markerPath -Force -ErrorAction SilentlyContinue
+
+            try {
+                $info = Invoke-YtDlpJson `
+                    -YtDlpPath $fakeYtDlpPath `
+                    -Url "https://youtube.com/watch?v=metadata-hang-once" `
+                    -TimeoutMilliseconds 300 `
+                    -MaxAttempts 2
+
+                Assert-True ($info.id -eq "abc123") "Expected the second metadata attempt to succeed."
+                $processIds = @(Get-Content -LiteralPath $markerPath | ForEach-Object { [int]$_ })
+                Assert-True ($processIds.Count -eq 2) "Expected one timed-out metadata process tree."
+                foreach ($processId in $processIds) {
+                    Assert-True (-not (Get-Process -Id $processId -ErrorAction SilentlyContinue)) "Retried metadata process $processId survived cleanup."
+                }
+            }
+            finally {
+                Remove-Item -LiteralPath $statePath, $markerPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
+        Name = "Repeated metadata timeout returns a bounded friendly error"
+        Run = {
+            $markerPath = Join-Path $fakeRoot "metadata-hang-always-pids.txt"
+            Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+            $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+
+            try {
+                try {
+                    Invoke-YtDlpJson `
+                        -YtDlpPath $fakeYtDlpPath `
+                        -Url "https://youtube.com/watch?v=metadata-hang-always" `
+                        -TimeoutMilliseconds 300 `
+                        -MaxAttempts 2 | Out-Null
+                    throw "Expected metadata timeout error."
+                }
+                catch {
+                    $stopwatch.Stop()
+                    Assert-True ($_.Exception.Message -eq "Checking the YouTube link took too long. Please try again.") "Unexpected timeout error: $($_.Exception.Message)"
+                    Assert-True ($stopwatch.ElapsedMilliseconds -lt 5000) "Repeated metadata timeout took $($stopwatch.ElapsedMilliseconds) ms."
+                }
+
+                $processIds = @(Get-Content -LiteralPath $markerPath | ForEach-Object { [int]$_ })
+                Assert-True ($processIds.Count -eq 4) "Expected two timed-out metadata process trees."
+                foreach ($processId in $processIds) {
+                    Assert-True (-not (Get-Process -Id $processId -ErrorAction SilentlyContinue)) "Timed-out metadata process $processId survived cleanup."
+                }
+            }
+            finally {
+                Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+            }
         }
     },
     @{

@@ -308,7 +308,10 @@ function Invoke-TranscriptProcess {
 
         [string[]]$ArgumentList = @(),
 
-        [string]$WorkingDirectory
+        [string]$WorkingDirectory,
+
+        [ValidateRange(0, 2147483647)]
+        [int]$TimeoutMilliseconds = 0
     )
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
@@ -333,15 +336,54 @@ function Invoke-TranscriptProcess {
 
         $stdOutTask = $process.StandardOutput.ReadToEndAsync()
         $stdErrTask = $process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
+        $timedOut = $false
 
-        $stdOut = $stdOutTask.GetAwaiter().GetResult()
-        $stdErr = $stdErrTask.GetAwaiter().GetResult()
+        if ($TimeoutMilliseconds -gt 0) {
+            if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+                $timedOut = $true
+                $taskkillPath = Join-Path ([System.Environment]::SystemDirectory) 'taskkill.exe'
+
+                if (Test-Path -LiteralPath $taskkillPath -PathType Leaf) {
+                    $taskkillStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+                    $taskkillStartInfo.FileName = $taskkillPath
+                    $taskkillStartInfo.Arguments = "/PID $($process.Id) /T /F"
+                    $taskkillStartInfo.UseShellExecute = $false
+                    $taskkillStartInfo.CreateNoWindow = $true
+
+                    $taskkillProcess = New-Object System.Diagnostics.Process
+                    $taskkillProcess.StartInfo = $taskkillStartInfo
+
+                    try {
+                        if ($taskkillProcess.Start()) {
+                            if (-not $taskkillProcess.WaitForExit(5000)) {
+                                $taskkillProcess.Kill()
+                                [void]$taskkillProcess.WaitForExit(1000)
+                            }
+                        }
+                    }
+                    finally {
+                        $taskkillProcess.Dispose()
+                    }
+                }
+
+                if (-not $process.WaitForExit(5000)) {
+                    $process.Kill()
+                    [void]$process.WaitForExit(1000)
+                }
+            }
+        }
+        else {
+            $process.WaitForExit()
+        }
+
+        $stdOut = if ($stdOutTask.Wait(1000)) { $stdOutTask.GetAwaiter().GetResult() } else { '' }
+        $stdErr = if ($stdErrTask.Wait(1000)) { $stdErrTask.GetAwaiter().GetResult() } else { '' }
         $output = @($stdOut, $stdErr) |
             Where-Object { -not [string]::IsNullOrEmpty($_) }
 
         return [pscustomobject]@{
-            ExitCode = $process.ExitCode
+            ExitCode = if ($timedOut) { -1 } else { $process.ExitCode }
+            TimedOut = $timedOut
             StdOut = $stdOut
             StdErr = $stdErr
             Output = ($output -join [System.Environment]::NewLine)
@@ -358,12 +400,30 @@ function Invoke-YtDlpJson {
         [string]$YtDlpPath,
 
         [Parameter(Mandatory = $true)]
-        [string]$Url
+        [string]$Url,
+
+        [ValidateRange(1, 2147483647)]
+        [int]$TimeoutMilliseconds = 20000,
+
+        [ValidateRange(1, 5)]
+        [int]$MaxAttempts = 2
     )
 
-    $result = Invoke-TranscriptProcess -FilePath $YtDlpPath -ArgumentList @(
-        '--skip-download', '--dump-single-json', '--no-warnings', '--no-playlist', $Url
-    )
+    $result = $null
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $result = Invoke-TranscriptProcess `
+            -FilePath $YtDlpPath `
+            -ArgumentList @('--skip-download', '--dump-single-json', '--no-warnings', '--no-playlist', $Url) `
+            -TimeoutMilliseconds $TimeoutMilliseconds
+
+        if (-not $result.TimedOut) {
+            break
+        }
+
+        if ($attempt -eq $MaxAttempts) {
+            throw "Checking the YouTube link took too long. Please try again."
+        }
+    }
 
     if ($result.ExitCode -ne 0) {
         $fullMessage = ([string]$result.Output).Trim()
