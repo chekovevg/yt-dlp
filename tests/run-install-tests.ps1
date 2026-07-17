@@ -366,6 +366,83 @@ $tests = @(
                 }
             }
         }
+    },
+    @{
+        Name = "Package contains exactly the installable application files"
+        Run = {
+            $buildScript = Join-Path $repoRoot "build-package.ps1"
+            if (-not (Test-Path -LiteralPath $buildScript -PathType Leaf)) {
+                throw "Package builder was not found: $buildScript"
+            }
+
+            $temporaryRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+            $testRoot = Join-Path $temporaryRoot ("youtube-transcript-install-test-" + [Guid]::NewGuid().ToString("N"))
+            $packagePath = Join-Path $testRoot "youtube-transcript-tool-windows.zip"
+
+            try {
+                New-Item -ItemType Directory -Path $testRoot | Out-Null
+                & powershell.exe `
+                    -NoProfile `
+                    -ExecutionPolicy Bypass `
+                    -File $buildScript `
+                    -OutputPath $packagePath
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Package builder exited with code $LASTEXITCODE."
+                }
+
+                Assert-True `
+                    (Test-Path -LiteralPath $packagePath -PathType Leaf) `
+                    "Package builder did not create the ZIP archive."
+
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                $archive = [System.IO.Compression.ZipFile]::OpenRead($packagePath)
+                try {
+                    $actualEntries = @(
+                        $archive.Entries |
+                            Where-Object { $_.Name } |
+                            ForEach-Object { $_.FullName.Replace("\", "/") } |
+                            Sort-Object
+                    )
+                }
+                finally {
+                    $archive.Dispose()
+                }
+
+                $expectedEntries = @(
+                    Get-Content -LiteralPath $fileManifest |
+                        ForEach-Object { $_.Trim() } |
+                        Where-Object { $_ -and -not $_.StartsWith("#") } |
+                        ForEach-Object { "YouTubeTranscriptTool/" + $_.Replace("\", "/") } |
+                        Sort-Object
+                )
+
+                Assert-True `
+                    (($actualEntries -join "|") -eq ($expectedEntries -join "|")) `
+                    ("Package entries did not match app-files.txt.`nActual: " +
+                        ($actualEntries -join ", "))
+                Assert-True `
+                    (-not ($actualEntries | Where-Object {
+                                $_ -match "(^|/)(tests|docs|\.git|\.worktrees)(/|$)"
+                            })) `
+                    "Package included development-only directories."
+            }
+            finally {
+                if (Test-Path -LiteralPath $testRoot) {
+                    $resolvedTestRoot = [System.IO.Path]::GetFullPath(
+                        (Resolve-Path -LiteralPath $testRoot).Path
+                    )
+                    $expectedPrefix = Join-Path $temporaryRoot "youtube-transcript-install-test-"
+                    if (-not $resolvedTestRoot.StartsWith(
+                            $expectedPrefix,
+                            [System.StringComparison]::OrdinalIgnoreCase
+                        )) {
+                        throw "Refusing to clean an unexpected installer test path: $resolvedTestRoot"
+                    }
+
+                    Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force
+                }
+            }
+        }
     }
 )
 

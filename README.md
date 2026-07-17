@@ -23,9 +23,30 @@ The bundled `yt-dlp.exe` next to the scripts is used first. The desktop app can 
 
 Python is not required.
 
-## Run The Desktop App
+## Install On Windows
 
-Double-click:
+1. Download the repository ZIP from GitHub and extract it, or download the `youtube-transcript-tool-windows` artifact from a successful GitHub Actions run.
+2. Open the extracted `YouTubeTranscriptTool` folder when using the packaged artifact.
+3. Double-click `install.cmd`.
+4. Launch `YouTube Transcript Tool` from the Start Menu or desktop shortcut.
+
+Installation is for the current Windows user, does not require administrator rights, and copies the application to:
+
+```text
+%LOCALAPPDATA%\Programs\YouTubeTranscriptTool
+```
+
+Running `install.cmd` again safely updates the known application files without deleting unrelated files or user settings.
+
+To remove the application, use `Uninstall YouTube Transcript Tool` in the Start Menu or run the installed `uninstall.cmd`. Settings are preserved by default. To remove them too, run:
+
+```powershell
+uninstall.cmd -RemoveSettings
+```
+
+## Portable Use
+
+The application can also run without installation. Double-click:
 
 ```text
 youtube-transcript-tool.cmd
@@ -66,9 +87,9 @@ The default command downloads subtitles into an isolated temporary folder, conve
 
 The tool does not delete or overwrite existing `.txt`, `.vtt`, or `.srt` files. It atomically locks one shared stem, writes complete artifacts in an operation-specific staging area, and publishes them with no-overwrite renames, so simultaneous desktop and command-line saves use distinct suffixes such as `-2` and `-3`. If conversion is cancelled or the desktop worker is terminated, operation-specific staging/download files and identity-matching partial publication are removed without touching pre-existing data.
 
-## Create A Desktop Shortcut
+## Create A Portable Desktop Shortcut
 
-Run this once from PowerShell:
+Installed copies already create desktop and Start Menu shortcuts. For portable use, run this once from PowerShell in the extracted tool folder:
 
 ```powershell
 cd D:\Tools\yt-dlp
@@ -180,6 +201,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-gui-smoke-te
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-gui-job-lifecycle-tests.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-transcript-tool-tests.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-download-subs-tests.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-install-tests.ps1
 ```
 
-The checks cover desktop launch/responding behavior, non-blocking background-job shutdown, the shared transcript core, the command-line interface, two-process atomic file-collision safety, and temporary-directory cleanup.
+The checks cover desktop launch/responding behavior, non-blocking background-job shutdown, the shared transcript core, the command-line interface, two-process atomic file-collision safety, temporary-directory cleanup, per-user installation, safe uninstall, and package contents.
+
+Build the distributable Windows ZIP with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-package.ps1
+```
+
+The default output is `dist\youtube-transcript-tool-windows.zip`.

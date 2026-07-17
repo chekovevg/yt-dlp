@@ -1,5 +1,6 @@
 README.md
 app-files.txt
+build-package.ps1
 create-desktop-shortcut.ps1
 download-subs.cmd
 download-subs.ps1
