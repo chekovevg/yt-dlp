@@ -187,6 +187,8 @@ try {
     $launcherPath = Join-Path $canonicalInstallDir "youtube-transcript-tool.cmd"
     $desktopShortcut = Join-Path $canonicalDesktopDir "YouTube Transcript Tool.lnk"
     $startMenuShortcut = Join-Path $canonicalStartMenuDir "YouTube Transcript Tool.lnk"
+    $uninstallCommand = Join-Path $canonicalInstallDir "uninstall.cmd"
+    $uninstallShortcut = Join-Path $canonicalStartMenuDir "Uninstall YouTube Transcript Tool.lnk"
     $shell = New-Object -ComObject WScript.Shell
 
     foreach ($shortcutPath in @($desktopShortcut, $startMenuShortcut)) {
@@ -198,11 +200,18 @@ try {
             -Description "Save readable text transcripts from YouTube videos"
     }
 
+    New-ApplicationShortcut `
+        -Shell $shell `
+        -Path $uninstallShortcut `
+        -TargetPath $uninstallCommand `
+        -WorkingDirectory $canonicalInstallDir `
+        -Description "Remove YouTube Transcript Tool"
+
     $marker = [pscustomobject]@{
         SchemaVersion = 1
         InstallDir = $canonicalInstallDir
         Files = @($runtimeFiles)
-        Shortcuts = @($desktopShortcut, $startMenuShortcut)
+        Shortcuts = @($desktopShortcut, $startMenuShortcut, $uninstallShortcut)
     }
     $markerPath = Join-Path $canonicalInstallDir ".install-manifest.json"
     $marker | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $markerPath -Encoding UTF8

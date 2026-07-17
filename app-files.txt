@@ -9,5 +9,7 @@ transcript-job-lifecycle.ps1
 transcript-tool-gui.ps1
 transcript-tool.psm1
 transcript-worker.ps1
+uninstall.cmd
+uninstall.ps1
 youtube-transcript-tool.cmd
 yt-dlp.exe
