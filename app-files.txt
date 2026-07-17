@@ -1,0 +1,13 @@
+README.md
+app-files.txt
+create-desktop-shortcut.ps1
+download-subs.cmd
+download-subs.ps1
+install.cmd
+install.ps1
+transcript-job-lifecycle.ps1
+transcript-tool-gui.ps1
+transcript-tool.psm1
+transcript-worker.ps1
+youtube-transcript-tool.cmd
+yt-dlp.exe
