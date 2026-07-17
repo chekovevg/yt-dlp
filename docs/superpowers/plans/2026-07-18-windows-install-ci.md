@@ -84,8 +84,6 @@ transcript-job-lifecycle.ps1
 transcript-tool-gui.ps1
 transcript-tool.psm1
 transcript-worker.ps1
-uninstall.cmd
-uninstall.ps1
 youtube-transcript-tool.cmd
 yt-dlp.exe
 ```
@@ -142,6 +140,7 @@ git commit -m "feat: add per-user Windows installer"
 ### Task 2: Safe uninstall
 
 **Files:**
+- Modify: `app-files.txt`
 - Create: `uninstall.cmd`
 - Create: `uninstall.ps1`
 - Modify: `tests/run-install-tests.ps1`
@@ -170,6 +169,8 @@ Add a settings fixture under an explicit `-SettingsDir` test path and assert it 
 Run the installer test. Expected: failure because uninstall entry points do not exist.
 
 - [ ] **Step 3: Implement marker-bound removal**
+
+Add `uninstall.cmd` and `uninstall.ps1` to `app-files.txt` before implementing removal, so every subsequent install includes the uninstaller.
 
 `uninstall.ps1` accepts:
 
