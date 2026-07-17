@@ -1,14 +1,16 @@
 # YouTube Transcript Tool
 
-Small Windows desktop utility for saving readable text transcripts from YouTube videos.
+Small Windows utility with desktop and command-line modes for saving readable text transcripts from YouTube videos.
 
-The tool uses the local `yt-dlp.exe` in this folder. It does not download video files and does not require a YouTube API key or login.
+The bundled `yt-dlp.exe` next to the scripts is used first. The desktop app can also fall back to `yt-dlp.exe` from `PATH`. The tool does not download video files and does not require a YouTube API key or login.
 
 ## What It Does
 
-- Opens as a small desktop window.
+- Provides a small desktop window and a script-friendly command-line mode.
 - Accepts a YouTube video link.
 - Saves a `.txt` transcript to a chosen local folder.
+- Remains usable while `yt-dlp` is running in the background.
+- Cancels the active background worker and its `yt-dlp` child process when the desktop window is closed.
 - Remembers the save folder, subtitle language, and "also save subtitles" checkbox between launches.
 - Can optionally save the original `.vtt` subtitle file next to the `.txt`.
 
@@ -16,14 +18,35 @@ The tool uses the local `yt-dlp.exe` in this folder. It does not download video 
 
 - Windows.
 - Windows PowerShell 5 or newer, included with Windows.
-- `yt-dlp.exe` next to the scripts in this folder, or installed in `PATH`.
+- The bundled `yt-dlp.exe` next to the scripts. The desktop app can alternatively use one installed in `PATH`.
 - Internet access.
 
 Python is not required.
 
-## Run
+## Install On Windows
 
-Double-click:
+1. Download the repository ZIP from GitHub and extract it, or download the `youtube-transcript-tool-windows` artifact from a successful GitHub Actions run.
+2. Open the extracted `YouTubeTranscriptTool` folder when using the packaged artifact.
+3. Double-click `install.cmd`.
+4. Launch `YouTube Transcript Tool` from the Start Menu or desktop shortcut.
+
+Installation is for the current Windows user, does not require administrator rights, and copies the application to:
+
+```text
+%LOCALAPPDATA%\Programs\YouTubeTranscriptTool
+```
+
+Running `install.cmd` again safely updates the known application files without deleting unrelated files or user settings.
+
+To remove the application, use `Uninstall YouTube Transcript Tool` in the Start Menu or run the installed `uninstall.cmd`. Settings are preserved by default. To remove them too, run:
+
+```powershell
+uninstall.cmd -RemoveSettings
+```
+
+## Portable Use
+
+The application can also run without installation. Double-click:
 
 ```text
 youtube-transcript-tool.cmd
@@ -31,9 +54,42 @@ youtube-transcript-tool.cmd
 
 If Windows opens a console for a moment, that is normal; the desktop window should appear after it.
 
-## Create A Desktop Shortcut
+## Run From The Command Line
 
-Run this once from PowerShell:
+Pass a YouTube URL to the console launcher:
+
+```powershell
+.\download-subs.cmd "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+Examples:
+
+```powershell
+# Prefer English and choose an output folder.
+.\download-subs.cmd "https://www.youtube.com/watch?v=VIDEO_ID" -Prefer en -OutputDir "D:\Transcripts"
+
+# Show the video's available subtitle tracks without downloading them.
+.\download-subs.cmd -List "https://www.youtube.com/watch?v=VIDEO_ID"
+
+# Request explicit yt-dlp language expressions.
+.\download-subs.cmd "https://www.youtube.com/watch?v=VIDEO_ID" -Langs "ru.*,en.*"
+```
+
+The default command downloads subtitles into an isolated temporary folder, converts the selected current-run subtitle to text, and then removes only that temporary folder.
+
+- `-KeepSubs` saves the transcript and also copies the selected subtitle from the current run into the output folder.
+- `-NoClean` skips text conversion and copies all subtitle files produced by the current run into the output folder. It does not expose or reuse the temporary working folder.
+- `-Srt` requests SRT instead of VTT.
+- `-CleanTranscript` enables the optional transcript-specific text normalization.
+- `-CleanOnly` converts an existing VTT or SRT file beside the scripts without deleting that source file.
+
+## File Safety
+
+The tool does not delete or overwrite existing `.txt`, `.vtt`, or `.srt` files. It atomically locks one shared stem, writes complete artifacts in an operation-specific staging area, and publishes them with no-overwrite renames, so simultaneous desktop and command-line saves use distinct suffixes such as `-2` and `-3`. If conversion is cancelled or the desktop worker is terminated, operation-specific staging/download files and identity-matching partial publication are removed without touching pre-existing data.
+
+## Create A Portable Desktop Shortcut
+
+Installed copies already create desktop and Start Menu shortcuts. For portable use, run this once from PowerShell in the extracted tool folder:
 
 ```powershell
 cd D:\Tools\yt-dlp
@@ -114,6 +170,15 @@ YouTube subtitles are often imperfect. Auto-generated captions can contain recog
 
 For publishing-quality text, use original-language subtitles as a draft and edit the result manually.
 
+## Update yt-dlp
+
+Updates are manual; the app does not update in the background and does not provide an update button. From PowerShell in the tool folder, install the current stable release and then check the bundled version:
+
+```powershell
+.\yt-dlp.exe -U
+.\yt-dlp.exe --version
+```
+
 ## Smoke Test Checklist
 
 1. Run `youtube-transcript-tool.cmd`.
@@ -129,14 +194,22 @@ For publishing-quality text, use original-language subtitles as a draft and edit
 
 ## Developer Checks
 
-Run backend smoke tests:
+Run every regression suite from the tool folder:
 
 ```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-gui-smoke-tests.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-gui-job-lifecycle-tests.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-transcript-tool-tests.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-download-subs-tests.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-install-tests.ps1
 ```
 
-Existing subtitle script regression tests:
+The checks cover desktop launch/responding behavior, non-blocking background-job shutdown, the shared transcript core, the command-line interface, two-process atomic file-collision safety, temporary-directory cleanup, per-user installation, safe uninstall, and package contents.
+
+Build the distributable Windows ZIP with:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-download-subs-tests.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-package.ps1
 ```
+
+The default output is `dist\youtube-transcript-tool-windows.zip`.

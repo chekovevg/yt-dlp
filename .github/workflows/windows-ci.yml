@@ -1,0 +1,91 @@
+name: Windows CI
+
+on:
+  pull_request:
+    branches:
+      - desktop-transcript-tool
+  push:
+    branches:
+      - desktop-transcript-tool
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Test and package
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Parse PowerShell sources
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $parseFailures = @()
+          $files = @(git ls-files -- "*.ps1" "*.psm1")
+
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD $file),
+              [ref]$tokens,
+              [ref]$errors
+            )
+
+            foreach ($parseError in $errors) {
+              $parseFailures += "${file}: $($parseError.Message)"
+            }
+          }
+
+          if ($parseFailures.Count -gt 0) {
+            $parseFailures | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+
+          Write-Host "Parsed $($files.Count) PowerShell files."
+
+      - name: Run regression suites
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tests = @(
+            ".\tests\run-gui-smoke-tests.ps1",
+            ".\tests\run-gui-job-lifecycle-tests.ps1",
+            ".\tests\run-transcript-tool-tests.ps1",
+            ".\tests\run-download-subs-tests.ps1",
+            ".\tests\run-install-tests.ps1"
+          )
+
+          foreach ($test in $tests) {
+            Write-Host "Running $test"
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $test
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          }
+
+      - name: Build Windows package
+        shell: powershell
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-package.ps1 -OutputPath .\dist\youtube-transcript-tool-windows.zip
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v7
+        with:
+          name: youtube-transcript-tool-windows
+          path: dist/youtube-transcript-tool-windows.zip
+          if-no-files-found: error
+          retention-days: 14

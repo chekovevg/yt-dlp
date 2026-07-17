@@ -4,6 +4,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $root = Split-Path -Parent $PSCommandPath
+. (Join-Path $root "transcript-job-lifecycle.ps1")
 Import-Module (Join-Path $root "transcript-tool.psm1") -Force
 
 function New-Utf8String {
@@ -45,7 +46,6 @@ function Set-UiStatus {
     )
 
     $Label.Text = $Text
-    [System.Windows.Forms.Application]::DoEvents()
 }
 
 function Show-UserError {
@@ -160,6 +160,211 @@ $resultBox.ReadOnly = $true
 $form.Controls.Add($resultBox)
 
 $lastOutputDir = $folderBox.Text
+$activeJob = $null
+$activeResult = $null
+$activeError = $null
+$activeWorkerIdentity = $null
+$activeProcessGroup = $null
+$activeStartGate = $null
+$activeWorkerIdentityPath = $null
+$deferredCleanupTicket = $null
+$activeOperationId = $null
+$activeTemporaryDirectory = $null
+$activeStagingRoot = $null
+$activeOutputDir = $null
+
+$jobTimer = New-Object System.Windows.Forms.Timer
+$jobTimer.Interval = 200
+
+$jobTimer.Add_Tick({
+    $job = $script:activeJob
+    if (-not $job) {
+        $jobTimer.Stop()
+        return
+    }
+
+    $receivedErrors = @()
+    $messages = @(Receive-Job `
+        -Job $job `
+        -ErrorAction SilentlyContinue `
+        -ErrorVariable +receivedErrors)
+    $jobState = $job.State
+
+    if ($jobState -in "Completed", "Failed", "Stopped") {
+        $messages += @(Receive-Job `
+            -Job $job `
+            -ErrorAction SilentlyContinue `
+            -ErrorVariable +receivedErrors)
+    }
+
+    if (-not $script:activeError -and $receivedErrors.Count -gt 0) {
+        $script:activeError = $receivedErrors[0]
+    }
+
+    foreach ($message in $messages) {
+        switch ([string]$message.Kind) {
+            "Worker" {
+                $script:activeWorkerIdentity = $message.Value
+
+                try {
+                    $script:activeProcessGroup = New-TranscriptProcessGroup `
+                        -WorkerIdentity $script:activeWorkerIdentity
+                }
+                catch {
+                    $script:activeError = $_
+                    $jobTimer.Stop()
+                    Request-ActiveTranscriptJobCleanup
+                    $saveButton.Enabled = $true
+                    $browseButton.Enabled = $true
+                    $openFolderButton.Enabled = $false
+                    Set-UiStatus -Label $statusLabel -Text $uiText.Error
+                    Show-UserError $_.Exception.Message
+                    $form.Close()
+                    return
+                }
+
+                if ($script:activeStartGate) {
+                    $startGate = $script:activeStartGate
+                    $script:activeStartGate = $null
+
+                    try {
+                        [void]$startGate.Set()
+                    }
+                    finally {
+                        $startGate.Dispose()
+                    }
+                }
+
+                if ($script:activeWorkerIdentityPath) {
+                    Remove-Item `
+                        -LiteralPath $script:activeWorkerIdentityPath `
+                        -Force `
+                        -ErrorAction SilentlyContinue
+                    $script:activeWorkerIdentityPath = $null
+                }
+            }
+            "Status" {
+                $status = [string]$message.Value
+                switch ($status) {
+                    "Checking link" { Set-UiStatus -Label $statusLabel -Text $uiText.Checking }
+                    "Looking for subtitles" { Set-UiStatus -Label $statusLabel -Text $uiText.Looking }
+                    "Saving file" { Set-UiStatus -Label $statusLabel -Text $uiText.Saving }
+                    "Done" { Set-UiStatus -Label $statusLabel -Text $uiText.Done }
+                    default { Set-UiStatus -Label $statusLabel -Text $status }
+                }
+            }
+            "Result" {
+                $script:activeResult = $message.Value
+            }
+        }
+    }
+
+    if ($jobState -notin "Completed", "Failed", "Stopped") {
+        return
+    }
+
+    $jobTimer.Stop()
+
+    if (-not $script:activeError) {
+        $script:activeError = $job.ChildJobs |
+            ForEach-Object { $_.Error } |
+            Select-Object -First 1
+    }
+
+    $result = $script:activeResult
+    $jobError = $script:activeError
+    $jobReason = $job.JobStateInfo.Reason
+
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    if ($script:activeProcessGroup) {
+        $script:activeProcessGroup.Dispose()
+    }
+    $script:activeJob = $null
+    $script:activeResult = $null
+    $script:activeError = $null
+    $script:activeWorkerIdentity = $null
+    $script:activeProcessGroup = $null
+    $script:activeOperationId = $null
+    $script:activeTemporaryDirectory = $null
+    $script:activeStagingRoot = $null
+    $script:activeOutputDir = $null
+
+    if ($script:activeStartGate) {
+        $script:activeStartGate.Dispose()
+        $script:activeStartGate = $null
+    }
+
+    if ($script:activeWorkerIdentityPath) {
+        Remove-Item `
+            -LiteralPath $script:activeWorkerIdentityPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+        $script:activeWorkerIdentityPath = $null
+    }
+
+    $saveButton.Enabled = $true
+    $browseButton.Enabled = $true
+
+    if ($jobState -eq "Completed" -and $result) {
+        $script:lastOutputDir = [string]$result.OutputDir
+        $resultBox.Text = [string]$result.TextPath
+        $openFolderButton.Enabled = $true
+        Set-UiStatus -Label $statusLabel -Text ($uiText.DoneFormat -f $result.Language, $result.Source)
+        return
+    }
+
+    $openFolderButton.Enabled = $false
+    Set-UiStatus -Label $statusLabel -Text $uiText.Error
+
+    $errorMessage = if ($jobError -and $jobError.Exception -and $jobError.Exception.Message) {
+        $jobError.Exception.Message
+    }
+    elseif ($jobError) {
+        [string]$jobError
+    }
+    elseif ($jobReason -and $jobReason.Message) {
+        $jobReason.Message
+    }
+    else {
+        "The transcript save did not return a result."
+    }
+
+    Show-UserError $errorMessage
+})
+
+function Request-ActiveTranscriptJobCleanup {
+    $job = $script:activeJob
+    if (-not $job) {
+        return
+    }
+
+    if ($script:activeStartGate) {
+        $script:activeStartGate.Dispose()
+        $script:activeStartGate = $null
+    }
+
+    $script:deferredCleanupTicket = Request-TranscriptBackgroundJobStop `
+        -Job $job `
+        -ProcessGroup $script:activeProcessGroup `
+        -WorkerIdentity $script:activeWorkerIdentity `
+        -WorkerIdentityPath $script:activeWorkerIdentityPath `
+        -OperationId $script:activeOperationId `
+        -OutputDir $script:activeOutputDir `
+        -TemporaryDirectory $script:activeTemporaryDirectory `
+        -StagingRoot $script:activeStagingRoot `
+        -UiDeadlineMilliseconds 1500
+
+    $script:activeJob = $null
+    $script:activeResult = $null
+    $script:activeError = $null
+    $script:activeWorkerIdentity = $null
+    $script:activeProcessGroup = $null
+    $script:activeWorkerIdentityPath = $null
+    $script:activeOperationId = $null
+    $script:activeTemporaryDirectory = $null
+    $script:activeStagingRoot = $null
+    $script:activeOutputDir = $null
+}
 
 $browseButton.Add_Click({
     $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -203,36 +408,165 @@ $saveButton.Add_Click({
     try {
         Write-TranscriptSettings -OutputDir $outputDir -Language $language -KeepSubtitles:$keepSubtitles
 
-        $result = Save-TranscriptFromYoutube `
-            -Url $url `
-            -OutputDir $outputDir `
-            -Language $language `
-            -KeepSubtitles:$keepSubtitles `
-            -OnStatus {
-                param($status)
-                switch ($status) {
-                    "Checking link" { Set-UiStatus -Label $statusLabel -Text $uiText.Checking }
-                    "Looking for subtitles" { Set-UiStatus -Label $statusLabel -Text $uiText.Looking }
-                    "Saving file" { Set-UiStatus -Label $statusLabel -Text $uiText.Saving }
-                    "Done" { Set-UiStatus -Label $statusLabel -Text $uiText.Done }
-                    default { Set-UiStatus -Label $statusLabel -Text $status }
-                }
-            }
+        $modulePath = Join-Path $root "transcript-tool.psm1"
+        $workerScriptPath = Join-Path $root "transcript-worker.ps1"
+        $script:activeResult = $null
+        $script:activeError = $null
+        $script:activeWorkerIdentity = $null
+        $script:activeProcessGroup = $null
+        $script:activeOperationId = [Guid]::NewGuid().ToString("N")
+        $script:activeOutputDir = $outputDir
+        $script:activeTemporaryDirectory = Join-Path `
+            ([System.IO.Path]::GetTempPath()) `
+            ("youtube-transcript-tool-" + $script:activeOperationId)
+        $script:activeStagingRoot = Join-Path `
+            $outputDir `
+            (".youtube-transcript-operation-" + $script:activeOperationId)
+        $startGateName = "Local\YouTubeTranscriptTool-" + [Guid]::NewGuid().ToString("N")
+        $script:activeWorkerIdentityPath = Join-Path `
+            ([System.IO.Path]::GetTempPath()) `
+            ("youtube-transcript-tool-worker-" + [Guid]::NewGuid().ToString("N") + ".json")
+        $script:activeStartGate = New-Object System.Threading.EventWaitHandle -ArgumentList @(
+            $false,
+            [System.Threading.EventResetMode]::ManualReset,
+            $startGateName
+        )
+        $script:activeJob = Start-Job `
+            -ArgumentList @(
+                $modulePath,
+                $workerScriptPath,
+                $url,
+                $outputDir,
+                $language,
+                $keepSubtitles,
+                $startGateName,
+                $script:activeWorkerIdentityPath,
+                $script:activeOperationId
+            ) `
+            -ScriptBlock {
+                param(
+                    $modulePath,
+                    $workerScriptPath,
+                    $url,
+                    $outputDir,
+                    $language,
+                    $keepSubtitles,
+                    $startGateName,
+                    $workerIdentityPath,
+                    $operationId
+                )
 
-        $lastOutputDir = $result.OutputDir
-        $resultBox.Text = $result.TextPath
-        $openFolderButton.Enabled = $true
-        Set-UiStatus -Label $statusLabel -Text ($uiText.DoneFormat -f $result.Language, $result.Source)
+                $ErrorActionPreference = "Stop"
+                $workerProcess = [System.Diagnostics.Process]::GetCurrentProcess()
+                $workerIdentity = [pscustomobject]@{
+                    Id = $PID
+                    CreationFileTimeUtc = $workerProcess.StartTime.ToUniversalTime().ToFileTimeUtc()
+                }
+                [System.IO.File]::WriteAllText(
+                    $workerIdentityPath,
+                    ($workerIdentity | ConvertTo-Json -Compress)
+                )
+                $startGate = [System.Threading.EventWaitHandle]::OpenExisting($startGateName)
+
+                try {
+                    [pscustomobject]@{
+                        Kind = "Worker"
+                        Value = $workerIdentity
+                    }
+
+                    [void]$startGate.WaitOne()
+                }
+                finally {
+                    $startGate.Dispose()
+                }
+
+                Import-Module $modulePath -Force
+
+                Invoke-TranscriptWorkerProcess `
+                    -WorkerScriptPath $workerScriptPath `
+                    -ArgumentList @(
+                        "-Url", $url,
+                        "-OutputDir", $outputDir,
+                        "-Language", $language,
+                        "-KeepSubtitles", $(if ($keepSubtitles) { "1" } else { "0" }),
+                        "-OperationId", $operationId
+                    )
+                }
+
+        $jobTimer.Start()
     }
     catch {
+        $jobTimer.Stop()
+
+        if ($script:activeJob) {
+            Request-ActiveTranscriptJobCleanup
+        }
+        elseif ($script:activeStartGate) {
+            $script:activeStartGate.Dispose()
+            $script:activeStartGate = $null
+        }
+
+        if ($script:activeWorkerIdentityPath) {
+            Remove-Item `
+                -LiteralPath $script:activeWorkerIdentityPath `
+                -Force `
+                -ErrorAction SilentlyContinue
+            $script:activeWorkerIdentityPath = $null
+        }
+
+        $script:activeResult = $null
+        $script:activeError = $null
+        $script:activeWorkerIdentity = $null
+        $script:activeProcessGroup = $null
+        $script:activeOperationId = $null
+        $script:activeTemporaryDirectory = $null
+        $script:activeStagingRoot = $null
+        $script:activeOutputDir = $null
         Set-UiStatus -Label $statusLabel -Text $uiText.Error
         Show-UserError $_.Exception.Message
-    }
-    finally {
         $saveButton.Enabled = $true
         $browseButton.Enabled = $true
+
+        if ($script:deferredCleanupTicket) {
+            $form.Close()
+        }
     }
+})
+
+$form.Add_FormClosing({
+    $jobTimer.Stop()
+
+    if ($script:activeJob -and -not $script:deferredCleanupTicket) {
+        Request-ActiveTranscriptJobCleanup
+    }
+    elseif ($script:activeStartGate) {
+        $script:activeStartGate.Dispose()
+        $script:activeStartGate = $null
+    }
+
+    if ($script:activeWorkerIdentityPath -and -not $script:deferredCleanupTicket) {
+        Remove-Item `
+            -LiteralPath $script:activeWorkerIdentityPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+        $script:activeWorkerIdentityPath = $null
+    }
+
+    $script:activeResult = $null
+    $script:activeError = $null
+    $script:activeWorkerIdentity = $null
+    $script:activeProcessGroup = $null
+    $script:activeOperationId = $null
+    $script:activeTemporaryDirectory = $null
+    $script:activeStagingRoot = $null
+    $script:activeOutputDir = $null
 })
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::Run($form)
+$jobTimer.Dispose()
+
+if ($script:deferredCleanupTicket) {
+    Complete-TranscriptBackgroundJobCleanup -Ticket $script:deferredCleanupTicket
+    $script:deferredCleanupTicket = $null
+}

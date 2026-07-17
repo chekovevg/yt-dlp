@@ -20,13 +20,13 @@ The CLI will preserve its public switches, but download operations will use a un
 
 For online CLI runs, normal conversion writes the transcript to `-OutputDir`. `-KeepSubs` additionally copies the selected subtitle into `-OutputDir`. `-NoClean` skips text conversion and copies every subtitle produced by the current run into `-OutputDir`; it never exposes or reuses the temporary workspace.
 
-The GUI keeps its current controls and wording. The save operation will run outside the WinForms UI thread, return status updates through the form thread, disable duplicate submissions while active, and restore the controls after success or failure.
+The GUI keeps its current controls and wording. The save operation runs outside the WinForms UI thread, returns status updates through the form thread, disables duplicate submissions while active, and restores the controls after success or failure. Closing the form only closes the worker start gate and captures a cleanup ticket; process-group termination, process discovery, resource disposal, and job removal run after the WinForms message loop exits.
 
 ## Native Process Execution
 
 A single internal helper will execute `yt-dlp` with stdout and stderr captured separately. stderr output will not become a terminating PowerShell error merely because `$ErrorActionPreference` is `Stop`. The helper returns exit code, stdout, and stderr; callers classify failures only after the process has exited.
 
-Successful commands may emit warnings without failing. Failed commands will retain the existing user-facing categories for invalid links, unavailable/private videos, network problems, rate limiting, and missing subtitles. Unexpected failures will include a bounded diagnostic message from `yt-dlp`.
+Successful commands may emit warnings without failing. Failed commands retain the existing user-facing categories for invalid links, unavailable/private videos, network problems, rate limiting, and missing subtitles. Rate limiting is classified before generic HTTP/network failures. Unexpected metadata and subtitle-download failures include a diagnostic tail bounded to approximately 2,000 characters.
 
 ## Subtitle Selection
 
@@ -36,7 +36,7 @@ Explicit `ru`, `en`, and `de` preferences will match exact tags and regional var
 
 ## Subtitle Parsing
 
-The converter will parse VTT/SRT structure with state rather than filtering every line through one broad regular expression. It will:
+The converter parses VTT/SRT structure with state rather than filtering every line through one broad regular expression. `WEBVTT`, `Kind:`, and `Language:` are recognized as technical headers only during the document-header phase, never after cue parsing begins. It will:
 
 - skip complete `NOTE`, `STYLE`, and `REGION` blocks;
 - skip cue identifiers and timestamp lines;
@@ -48,9 +48,9 @@ The converter will parse VTT/SRT structure with state rather than filtering ever
 
 ## File Safety
 
-Every online download uses a GUID-named temporary directory and an explicit output template. Cleanup is limited to that directory. Existing `.vtt`, `.srt`, and `.txt` files outside it are never deleted.
+Every online download uses a GUID-named temporary directory and an explicit output template. Cleanup is limited to that directory. Existing `.vtt`, `.srt`, and `.txt` files outside it are never deleted or overwritten.
 
-When an output transcript name already exists, the tool will continue to overwrite that same deterministic target, matching current GUI behavior. Optional subtitle preservation copies the selected subtitle next to the text only after conversion succeeds.
+Before converting or copying output, the shared core atomically acquires a per-candidate `FileMode.CreateNew` lock configured with `DeleteOnClose`. Existing targets or a live lock advance the complete artifact set to the next numeric stem (`-2`, `-3`, and so on). Every text/review/subtitle artifact is written completely into an operation-GUID staging directory on the same output volume. A manifest records each target and the staging file's stable Windows volume/file-index identity before atomic no-replace renames publish any artifact; a commit marker is written only after every rename succeeds. Normal failure, hard worker termination, and interrupted multi-artifact publication therefore leave either no final set or one complete final set. Deferred GUI cleanup removes a partially published target only through an identity-validated file handle, then removes the exact operation staging and download workspaces. `DeleteOnClose` removes the interprocess lock when a worker is killed. Existing data is never deleted by path alone or overwritten. The same rule applies to `-CleanOnly`, `-NoClean`, normal CLI downloads, and GUI-core saves.
 
 ## Interfaces
 
@@ -70,14 +70,21 @@ The module regression suite will cover:
 - regional language tags;
 - exclusion of `live_chat`;
 - structured VTT blocks, numeric captions, duplicate captions, and empty output;
-- end-to-end saving with a fake `yt-dlp` executable.
+- VTT/SRT cue text beginning exactly with `WEBVTT`, `Kind:`, or `Language:`;
+- end-to-end saving with a fake `yt-dlp` executable;
+- atomic two-process `-2`/`-3` output claims across transcript, review, and subtitle artifacts;
+- deterministic hard cancellation immediately after the first multi-artifact publish, including durable-manifest assertions, identity-safe rollback, same-path substitution preservation, committed-set retention, and complete process/workspace cleanup;
+- exact public result shapes, callback-output suppression, bounded diagnostics, and temporary workspace cleanup;
+- restoration of whitespace cleanup immediately inside brackets.
 
 The CLI suite will cover:
 
 - preservation of existing subtitle files in `-CleanOnly` mode;
 - isolation from unrelated subtitle files;
 - operation when launched from a working directory different from the script directory;
-- preservation of existing switches and language ordering.
+- preservation of existing switches and language ordering;
+- `-NoClean`, `-KeepSubs`, `-Srt`, and explicit `-Langs` behavior under output collisions;
+- diagnostics for complete download failure and downloaded-despite-error results.
 
 Final verification includes both test suites, PowerShell parser validation, checksum validation for `yt-dlp.exe`, a real public YouTube transcript download to a temporary directory, and a GUI launch smoke test.
 

@@ -14,7 +14,7 @@
 - Keep both `youtube-transcript-tool.cmd` and `download-subs.cmd`.
 - Keep the current visible WinForms layout and wording.
 - Preserve CLI switches: `-List`, `-CleanOnly`, `-NoClean`, `-KeepSubs`, `-Srt`, `-CleanTranscript`, `-Prefer`, `-OutputDir`, and `-Langs`.
-- Never delete `.vtt`, `.srt`, or `.txt` files that existed before the current invocation.
+- Never delete or overwrite `.vtt`, `.srt`, or `.txt` files that existed before the current invocation. If any planned target exists, select the next free numeric stem (`-2`, `-3`, and so on) and use that same stem for coordinated transcript, review, and copied-subtitle artifacts.
 - Keep transcript-specific normalization opt-in behind `-CleanTranscript`.
 - Add a failing regression test before each production behavior change except the WinForms thread handoff, for which the user explicitly approved a launch/responding smoke test plus live verification instead of test-only UI hooks.
 
@@ -237,7 +237,7 @@ git commit -m "fix: parse subtitle structure safely"
 
 **Interfaces:**
 - Adds: `Save-TranscriptFromSubtitleFile([string]$Path, [string]$OutputDir, [bool]$CleanTranscript) -> PSCustomObject` with `TextPath` and `ReviewPath`.
-- Adds: `Save-TranscriptFromYoutubeCli([string]$Url, [string]$OutputDir, [string]$Preference, [string]$SubtitleLanguages, [bool]$NoClean, [bool]$KeepSubtitles, [bool]$Srt, [bool]$CleanTranscript, [string]$YtDlpPath, [scriptblock]$OnAttempt) -> PSCustomObject`.
+- Adds: `Save-TranscriptFromYoutubeCli([string]$Url, [string]$OutputDir, [string]$Preference, [string]$SubtitleLanguages, [bool]$NoClean, [bool]$KeepSubtitles, [bool]$Srt, [bool]$CleanTranscript, [string]$YtDlpPath, [scriptblock]$OnAttempt) -> PSCustomObject` with one result object containing `TextPath`, `ReviewPath`, `SubtitlePaths`, `OutputDir`, `FoundSubtitles`, `ExitCode`, `YtDlpExitCode`, bounded `Output`, and bounded `StdErr`.
 - Keeps: every existing CLI parameter and exit-code convention.
 
 - [ ] **Step 1: Add failing file-safety tests**
@@ -248,6 +248,8 @@ Extend the CLI test suite with three cases:
 2. An online run with two unrelated `.en.vtt` files beside the script leaves both present and converts only the fake executable's fresh output.
 3. A run whose process working directory differs from the script directory still writes the expected result to the requested `-OutputDir`.
 
+Add review regressions proving that pre-existing output bytes remain unchanged while new `.txt`, `.clean.txt`, `.review.txt`, `.vtt`, and `.srt` artifacts use coordinated `-2`/`-3` stems. Cover `-NoClean`, `-KeepSubs`, `-Srt`, explicit `-Langs`, exact public result shapes, callback output, bounded failure diagnostics, downloaded-despite-error diagnostics, temporary cleanup, and whitespace immediately inside brackets.
+
 Update `Invoke-DownloadSubs` with an optional `WorkingDirectory` parameter used only by test case 3.
 
 - [ ] **Step 2: Run the CLI suite and verify RED**
@@ -256,17 +258,17 @@ Expected: case 1 loses its source, case 2 deletes unrelated files or converts th
 
 - [ ] **Step 3: Add shared subtitle-file saving**
 
-Move the opt-in transcript normalization helpers from `download-subs.ps1` into `transcript-tool.psm1`. Implement `Save-TranscriptFromSubtitleFile` so it converts through the shared structural parser, writes `.txt` or `.clean.txt` in `OutputDir`, writes `.review.txt` only for transcript mode, and never deletes `Path`.
+Move the opt-in transcript normalization helpers from `download-subs.ps1` into `transcript-tool.psm1`. Implement `Save-TranscriptFromSubtitleFile` so it converts through the shared structural parser, writes `.txt` or `.clean.txt` in `OutputDir`, writes `.review.txt` only for transcript mode, and never deletes `Path` or overwrites an output. Acquire each candidate stem with a `CreateNew`/`DeleteOnClose` interprocess lock, write complete artifacts into an operation-GUID staging directory on the output volume, record stable file identities in a manifest, then publish with atomic no-replace renames and a final commit marker. Roll back interrupted publication only through identity-validated handles.
 
 - [ ] **Step 4: Add safe CLI online saving**
 
 Implement `Save-TranscriptFromYoutubeCli` with one top-level GUID temporary directory and one attempt subdirectory per language expression. Determine attempts from explicit `SubtitleLanguages`, explicit `Preference`, or detected video language followed by `ru`, `en`, and `de`. For each attempt invoke `yt-dlp` with both subtitle-source flags, explicit `-o` inside the attempt directory, and `vtt/best` or `srt/best` settings. Stop only when that attempt directory contains a new `.vtt` or `.srt`.
 
-For `NoClean`, copy every current-run subtitle to `OutputDir`. Otherwise select the preferred current-run file, call `Save-TranscriptFromSubtitleFile`, and copy only that subtitle when `KeepSubtitles` is true. Remove only the top-level temporary directory in `finally`.
+For `NoClean`, atomically reserve each coordinated current-run subtitle group in `OutputDir` and copy through the reserved streams. Otherwise select the preferred current-run file, atomically reserve every transcript/review/subtitle target for one stem, convert and copy through those streams, and release only this invocation's reservations on failure. Suppress output from `OnAttempt` so the function returns exactly one object. Carry the last process `Output` and `StdErr`, bounded to 2,000 characters each, in every result. Remove only the top-level temporary directory in `finally`.
 
 - [ ] **Step 5: Replace CLI orchestration with module calls**
 
-Keep the parameter block and console messages in `download-subs.ps1`. Import `transcript-tool.psm1`; route `-List` through `Invoke-TranscriptProcess`, `-CleanOnly` through `Save-TranscriptFromSubtitleFile`, and online work through `Save-TranscriptFromYoutubeCli`. Open Notepad only when a text result exists. Remove the old download-state comparison and `Remove-IntermediateSubtitleFiles` logic.
+Keep the parameter block and console messages in `download-subs.ps1`. Import `transcript-tool.psm1`; route `-List` through `Invoke-TranscriptProcess`, `-CleanOnly` through `Save-TranscriptFromSubtitleFile`, and online work through `Save-TranscriptFromYoutubeCli`. Print the bounded last-attempt diagnostic when every attempt fails and include it in the downloaded-despite-error warning. Open Notepad only when a text result exists. Remove the old download-state comparison and `Remove-IntermediateSubtitleFiles` logic.
 
 - [ ] **Step 6: Run both suites and verify GREEN**
 
@@ -294,7 +296,7 @@ git commit -m "fix: isolate command-line subtitle downloads"
 
 - [ ] **Step 1: Add a GUI launch smoke test**
 
-Create `tests/run-gui-smoke-tests.ps1`. Launch `powershell.exe -NoProfile -ExecutionPolicy Bypass -File transcript-tool-gui.ps1` with `Start-Process -WindowStyle Hidden -PassThru`, poll for up to five seconds until `MainWindowTitle` equals `YouTube Transcript Tool`, assert `Responding`, then stop only that exact process id in `finally`.
+Create `tests/run-gui-smoke-tests.ps1`. Repeat the production launcher semantics by passing `-WindowStyle Hidden` to `powershell.exe` before `-File transcript-tool-gui.ps1` (do not use the `Start-Process -WindowStyle Hidden` property, which also hides the WinForms window). Enumerate visible top-level windows for the exact child PID for up to ten seconds, require the title `YouTube Transcript Tool`, assert `Responding`, then stop only that exact process id in `finally`.
 
 - [ ] **Step 2: Run the smoke test before editing**
 
@@ -304,7 +306,7 @@ Expected: PASS. This establishes that the existing window launches before changi
 
 On click, save settings, disable buttons, and start a job that imports the module and calls `Save-TranscriptFromYoutube`. Emit objects shaped as `{ Kind = 'Status'; Value = <status> }` and `{ Kind = 'Result'; Value = <result> }`. Start the WinForms timer.
 
-On each timer tick, call `Receive-Job` without `-Keep`, map status objects through the existing localized status switch, store the result object, and when job state is complete or failed: stop the timer, show the result or the job's first error, remove the job, re-enable controls, and enable Open Folder only after success. On form close, stop and remove an active job before exiting.
+On each timer tick, call `Receive-Job` without `-Keep`, map status objects through the existing localized status switch, store the result object, and when job state is complete or failed: stop the timer, show the result or the job's first error, remove the terminal job, re-enable controls, and enable Open Folder only after success. Before worker work begins, the GUI parent owns the operation GUID and exact staging/download paths. On form close, dispose the start gate and capture those values in a cleanup ticket without calling process termination synchronously. After `Application.Run` returns, terminate/dispose the process group, perform any safe identity fallback, remove the active job, roll back only identity-matching partial publication, and remove the validated operation workspaces.
 
 - [ ] **Step 4: Run GUI smoke and backend suites**
 
