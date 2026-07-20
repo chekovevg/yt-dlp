@@ -189,10 +189,130 @@ function Assert-TranscriptOutputDirectoriesWritable {
     }
 }
 
+function New-TranscriptBatchPlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Rows,
+
+        [Parameter(Mandatory = $true)]
+        [string]$RootDir,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("auto", "ru", "en", "de")]
+        [string]$Language
+    )
+
+    if (@($Rows).Count -gt 6) {
+        throw [System.ArgumentException]::new("TooManyRows")
+    }
+
+    $items = @()
+    foreach ($row in @($Rows)) {
+        $url = ([string]$row.Url).Trim()
+        if (-not $url) {
+            continue
+        }
+
+        $projectName = ([string]$row.ProjectName).Trim()
+        $outputDir = Resolve-TranscriptProjectOutputDirectory `
+            -RootDir $RootDir `
+            -ProjectName $projectName `
+            -RequireExisting
+
+        $items += [pscustomobject]@{
+            CardId = [string]$row.CardId
+            Url = $url
+            ProjectName = $projectName
+            OutputDir = $outputDir
+            Language = $Language
+        }
+    }
+
+    if ($items.Count -eq 0) {
+        throw [System.ArgumentException]::new("NoVideos")
+    }
+
+    return @($items)
+}
+
+function New-TranscriptQueueState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Items
+    )
+
+    $queueItems = @($Items)
+    return [pscustomobject]@{
+        Items = $queueItems
+        NextIndex = 0
+        Completed = 0
+        Failed = 0
+        IsRunning = ($queueItems.Count -gt 0)
+    }
+}
+
+function Get-TranscriptQueueCurrentItem {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$State
+    )
+
+    if (-not $State.IsRunning -or $State.NextIndex -ge $State.Items.Count) {
+        return $null
+    }
+
+    return $State.Items[$State.NextIndex]
+}
+
+function Move-TranscriptQueueNext {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$State,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$Succeeded
+    )
+
+    if (-not $State.IsRunning -or $State.NextIndex -ge $State.Items.Count) {
+        throw [System.InvalidOperationException]::new("QueueNotRunning")
+    }
+
+    if ($Succeeded) {
+        $State.Completed++
+    }
+    else {
+        $State.Failed++
+    }
+
+    $State.NextIndex++
+    if ($State.NextIndex -ge $State.Items.Count) {
+        $State.IsRunning = $false
+    }
+}
+
+function Get-TranscriptQueueSummary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$State
+    )
+
+    return [pscustomobject]@{
+        Total = $State.Items.Count
+        Completed = $State.Completed
+        Failed = $State.Failed
+        IsRunning = [bool]$State.IsRunning
+    }
+}
+
 Export-ModuleMember -Function @(
     "Get-TranscriptProjectNameValidation",
     "Get-TranscriptProjectNames",
     "Resolve-TranscriptProjectOutputDirectory",
     "New-TranscriptProjectDirectory",
-    "Assert-TranscriptOutputDirectoriesWritable"
+    "Assert-TranscriptOutputDirectoriesWritable",
+    "New-TranscriptBatchPlan",
+    "New-TranscriptQueueState",
+    "Get-TranscriptQueueCurrentItem",
+    "Move-TranscriptQueueNext",
+    "Get-TranscriptQueueSummary"
 )

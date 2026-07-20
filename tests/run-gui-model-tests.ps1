@@ -219,6 +219,143 @@ $tests = @(
                 }
             }
         }
+    },
+    @{
+        Name = "Batch planning ignores blanks and preserves visual order"
+        Run = {
+            $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+                "transcript-gui-model-tests-" + [Guid]::NewGuid().ToString("N")
+            )
+
+            try {
+                $projectDir = Join-Path $testRoot "Research"
+                New-Item -ItemType Directory -Path $projectDir -Force | Out-Null
+                $rows = @(
+                    [pscustomobject]@{
+                        CardId = "one"
+                        Url = " https://youtu.be/one "
+                        ProjectName = "Research"
+                    },
+                    [pscustomobject]@{
+                        CardId = "blank"
+                        Url = " "
+                        ProjectName = ""
+                    },
+                    [pscustomobject]@{
+                        CardId = "two"
+                        Url = "https://youtu.be/two"
+                        ProjectName = ""
+                    }
+                )
+
+                $plan = @(
+                    New-TranscriptBatchPlan `
+                        -Rows $rows `
+                        -RootDir $testRoot `
+                        -Language "ru"
+                )
+
+                Assert-Equal $plan.Count 2 "Blank rows were not ignored."
+                Assert-Equal $plan[0].CardId "one" "Batch order changed."
+                Assert-Equal $plan[0].Url "https://youtu.be/one" "URL was not trimmed."
+                Assert-Equal $plan[0].OutputDir ([System.IO.Path]::GetFullPath($projectDir)) "Project output changed."
+                Assert-Equal $plan[1].CardId "two" "Batch order changed."
+                Assert-Equal $plan[1].OutputDir ([System.IO.Path]::GetFullPath($testRoot)) "Root output changed."
+                Assert-Equal $plan[1].Language "ru" "Shared language changed."
+            }
+            finally {
+                if (Test-Path -LiteralPath $testRoot) {
+                    Remove-Item -LiteralPath $testRoot -Recurse -Force
+                }
+            }
+        }
+    },
+    @{
+        Name = "Batch planning enforces queue limits and existing projects"
+        Run = {
+            $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+                "transcript-gui-model-tests-" + [Guid]::NewGuid().ToString("N")
+            )
+
+            try {
+                New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
+
+                Assert-ThrowsMessage `
+                    -Action {
+                        New-TranscriptBatchPlan `
+                            -Rows @([pscustomobject]@{ CardId = "one"; Url = ""; ProjectName = "" }) `
+                            -RootDir $testRoot `
+                            -Language "auto"
+                    } `
+                    -ExpectedMessage "NoVideos" `
+                    -Message "An empty batch was accepted."
+
+                $tooMany = 1..7 | ForEach-Object {
+                    [pscustomobject]@{ CardId = "card-$_"; Url = ""; ProjectName = "" }
+                }
+                Assert-ThrowsMessage `
+                    -Action {
+                        New-TranscriptBatchPlan `
+                            -Rows $tooMany `
+                            -RootDir $testRoot `
+                            -Language "auto"
+                    } `
+                    -ExpectedMessage "TooManyRows" `
+                    -Message "More than six cards were accepted."
+
+                Assert-ThrowsMessage `
+                    -Action {
+                        New-TranscriptBatchPlan `
+                            -Rows @(
+                                [pscustomobject]@{
+                                    CardId = "one"
+                                    Url = "https://youtu.be/one"
+                                    ProjectName = "Missing"
+                                }
+                            ) `
+                            -RootDir $testRoot `
+                            -Language "auto"
+                    } `
+                    -ExpectedMessage "ProjectMissing" `
+                    -Message "A missing selected project was accepted."
+            }
+            finally {
+                if (Test-Path -LiteralPath $testRoot) {
+                    Remove-Item -LiteralPath $testRoot -Recurse -Force
+                }
+            }
+        }
+    },
+    @{
+        Name = "Queue state continues after failure and reports totals"
+        Run = {
+            $items = @(
+                [pscustomobject]@{ CardId = "one" },
+                [pscustomobject]@{ CardId = "two" }
+            )
+            $state = New-TranscriptQueueState -Items $items
+
+            Assert-True $state.IsRunning "A non-empty queue started idle."
+            Assert-Equal `
+                (Get-TranscriptQueueCurrentItem -State $state).CardId `
+                "one" `
+                "Wrong first queue item."
+
+            Move-TranscriptQueueNext -State $state -Succeeded $false
+            Assert-True $state.IsRunning "A failed item stopped the queue."
+            Assert-Equal `
+                (Get-TranscriptQueueCurrentItem -State $state).CardId `
+                "two" `
+                "Queue did not advance after failure."
+
+            Move-TranscriptQueueNext -State $state -Succeeded $true
+            $summary = Get-TranscriptQueueSummary -State $state
+            Assert-Equal $summary.Total 2 "Queue total changed."
+            Assert-Equal $summary.Completed 1 "Completed count changed."
+            Assert-Equal $summary.Failed 1 "Failed count changed."
+            Assert-True (-not $summary.IsRunning) "Finished queue remained active."
+            Assert-Equal (Get-TranscriptQueueCurrentItem -State $state) $null "Finished queue exposed an item."
+        }
     }
 )
 
