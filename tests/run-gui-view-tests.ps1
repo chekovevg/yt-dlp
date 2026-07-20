@@ -81,6 +81,12 @@ try {
         "Clear action lacks a tooltip."
     Assert-Equal $secondCard.ProjectBox.SelectedItem.Value "" "Cards do not default to the root."
     Assert-Equal $secondCard.ProjectBox.Items.Count 2 "Project selector items changed."
+    Assert-True `
+        ($secondCard.CreateProjectButton.Dock -ne [System.Windows.Forms.DockStyle]::Fill) `
+        "Create-project action stretches vertically across the card."
+    Assert-True `
+        ($secondCard.Container.MinimumSize.Height -eq 0) `
+        "Card has an artificial minimum height."
     Assert-True (-not $secondCard.CopyTextButton.Visible) "Copy action is visible before success."
     Assert-True (-not $secondCard.RetryButton.Visible) "Retry action is visible before failure."
 

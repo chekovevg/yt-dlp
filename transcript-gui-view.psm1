@@ -3,8 +3,6 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-Import-Module (Join-Path $PSScriptRoot "transcript-gui-model.psm1") -Force
-
 function Get-TranscriptUiText {
     param(
         [Parameter(Mandatory = $true)]
@@ -115,7 +113,7 @@ function New-TranscriptVideoCardView {
     $container.ColumnCount = 1
     $container.Dock = [System.Windows.Forms.DockStyle]::Top
     $container.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 10)
-    $container.MinimumSize = New-Object System.Drawing.Size(640, 126)
+    $container.MinimumSize = New-Object System.Drawing.Size(640, 0)
     $container.Padding = New-Object System.Windows.Forms.Padding(10)
     $container.RowCount = 3
     [void]$container.RowStyles.Add(
@@ -153,6 +151,7 @@ function New-TranscriptVideoCardView {
 
     $removeButton = New-Object System.Windows.Forms.Button
     $removeButton.AccessibleName = $UiText.RemoveRow
+    $removeButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
     $removeButton.AutoSize = $true
     $removeButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
     $removeButton.Margin = New-Object System.Windows.Forms.Padding(8, 0, 0, 4)
@@ -191,12 +190,14 @@ function New-TranscriptVideoCardView {
 
     $urlBox = New-Object System.Windows.Forms.TextBox
     $urlBox.AccessibleName = $UiText.Url
+    $urlBox.AccessibleRole = [System.Windows.Forms.AccessibleRole]::Text
     $urlBox.Dock = [System.Windows.Forms.DockStyle]::Fill
     $urlBox.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 0)
     $urlHost.Controls.Add($urlBox, 0, 0)
 
     $clearButton = New-Object System.Windows.Forms.Button
     $clearButton.AccessibleName = $UiText.ClearUrl
+    $clearButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
     $clearButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
     $clearButton.Margin = New-Object System.Windows.Forms.Padding(4, 0, 0, 0)
     $clearButton.Size = New-Object System.Drawing.Size(30, 27)
@@ -207,6 +208,7 @@ function New-TranscriptVideoCardView {
 
     $projectBox = New-Object System.Windows.Forms.ComboBox
     $projectBox.AccessibleName = $UiText.Project
+    $projectBox.AccessibleRole = [System.Windows.Forms.AccessibleRole]::ComboBox
     $projectBox.DisplayMember = "Label"
     $projectBox.Dock = [System.Windows.Forms.DockStyle]::Fill
     $projectBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
@@ -215,9 +217,14 @@ function New-TranscriptVideoCardView {
 
     $createProjectButton = New-Object System.Windows.Forms.Button
     $createProjectButton.AccessibleName = $UiText.CreateProject
-    $createProjectButton.AutoSize = $true
-    $createProjectButton.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $createProjectButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
+    $createProjectButton.Anchor = (
+        [System.Windows.Forms.AnchorStyles]::Top -bor
+        [System.Windows.Forms.AnchorStyles]::Left
+    )
+    $createProjectButton.AutoSize = $false
     $createProjectButton.Margin = New-Object System.Windows.Forms.Padding(0)
+    $createProjectButton.Size = New-Object System.Drawing.Size(126, 28)
     $createProjectButton.Text = $UiText.CreateProject
     $inputRow.Controls.Add($createProjectButton, 2, 0)
     $container.Controls.Add($inputRow, 0, 1)
@@ -248,6 +255,7 @@ function New-TranscriptVideoCardView {
 
     $copyTextButton = New-Object System.Windows.Forms.Button
     $copyTextButton.AccessibleName = $UiText.CopyText
+    $copyTextButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
     $copyTextButton.AutoSize = $true
     $copyTextButton.Margin = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
     $copyTextButton.Text = $UiText.CopyText
@@ -256,6 +264,7 @@ function New-TranscriptVideoCardView {
 
     $retryButton = New-Object System.Windows.Forms.Button
     $retryButton.AccessibleName = $UiText.Retry
+    $retryButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
     $retryButton.AutoSize = $true
     $retryButton.Margin = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
     $retryButton.Text = $UiText.Retry
@@ -405,6 +414,7 @@ function New-TranscriptMainView {
 
     $rootBox = New-Object System.Windows.Forms.TextBox
     $rootBox.AccessibleName = $UiText.SaveFolder
+    $rootBox.AccessibleRole = [System.Windows.Forms.AccessibleRole]::Text
     $rootBox.Dock = [System.Windows.Forms.DockStyle]::Fill
     $rootBox.Margin = New-Object System.Windows.Forms.Padding(0, 3, 8, 8)
     $rootBox.Text = [string]$Settings.OutputDir
@@ -412,6 +422,7 @@ function New-TranscriptMainView {
 
     $browseButton = New-Object System.Windows.Forms.Button
     $browseButton.AccessibleName = $UiText.Browse
+    $browseButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
     $browseButton.AutoSize = $true
     $browseButton.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
     $browseButton.Text = $UiText.Browse
@@ -425,6 +436,7 @@ function New-TranscriptMainView {
 
     $languageBox = New-Object System.Windows.Forms.ComboBox
     $languageBox.AccessibleName = $UiText.Language
+    $languageBox.AccessibleRole = [System.Windows.Forms.AccessibleRole]::ComboBox
     $languageBox.DisplayMember = "Label"
     $languageBox.Dock = [System.Windows.Forms.DockStyle]::Left
     $languageBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
@@ -461,6 +473,7 @@ function New-TranscriptMainView {
 
     $addVideoButton = New-Object System.Windows.Forms.Button
     $addVideoButton.AccessibleName = $UiText.AddVideo
+    $addVideoButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
     $addVideoButton.AutoSize = $true
     $addVideoButton.Margin = New-Object System.Windows.Forms.Padding(0, 0, 10, 0)
     $addVideoButton.Text = $UiText.AddVideo
@@ -498,6 +511,7 @@ function New-TranscriptMainView {
 
     $saveQueueButton = New-Object System.Windows.Forms.Button
     $saveQueueButton.AccessibleName = $UiText.SaveVideos
+    $saveQueueButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
     $saveQueueButton.AutoSize = $true
     $saveQueueButton.Font = New-Object System.Drawing.Font(
         "Segoe UI",
@@ -510,6 +524,7 @@ function New-TranscriptMainView {
 
     $openRootButton = New-Object System.Windows.Forms.Button
     $openRootButton.AccessibleName = $UiText.OpenRoot
+    $openRootButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
     $openRootButton.AutoSize = $true
     $openRootButton.Margin = New-Object System.Windows.Forms.Padding(0, 0, 10, 0)
     $openRootButton.Text = $UiText.OpenRoot
@@ -517,6 +532,7 @@ function New-TranscriptMainView {
 
     $copyRootPathButton = New-Object System.Windows.Forms.Button
     $copyRootPathButton.AccessibleName = $UiText.CopyRootPath
+    $copyRootPathButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
     $copyRootPathButton.AutoSize = $true
     $copyRootPathButton.Margin = New-Object System.Windows.Forms.Padding(0)
     $copyRootPathButton.Text = $UiText.CopyRootPath
@@ -601,6 +617,7 @@ function Show-TranscriptProjectDialog {
 
     $nameBox = New-Object System.Windows.Forms.TextBox
     $nameBox.AccessibleName = $UiText.ProjectName
+    $nameBox.AccessibleRole = [System.Windows.Forms.AccessibleRole]::Text
     $nameBox.Dock = [System.Windows.Forms.DockStyle]::Fill
     $nameBox.Margin = New-Object System.Windows.Forms.Padding(0, 6, 0, 4)
     $layout.Controls.Add($nameBox, 0, 1)
@@ -618,12 +635,14 @@ function Show-TranscriptProjectDialog {
 
     $cancelButton = New-Object System.Windows.Forms.Button
     $cancelButton.AccessibleName = $UiText.Cancel
+    $cancelButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
     $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     $cancelButton.Text = $UiText.Cancel
     [void]$actions.Controls.Add($cancelButton)
 
     $okButton = New-Object System.Windows.Forms.Button
     $okButton.AccessibleName = $UiText.Ok
+    $okButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
     $okButton.Text = $UiText.Ok
     [void]$actions.Controls.Add($okButton)
     $layout.Controls.Add($actions, 0, 3)
