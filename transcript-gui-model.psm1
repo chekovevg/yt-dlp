@@ -304,6 +304,46 @@ function Get-TranscriptQueueSummary {
     }
 }
 
+function Resolve-TranscriptResultFilePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw [System.IO.FileNotFoundException]::new("ResultFileMissing")
+    }
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+        throw [System.IO.FileNotFoundException]::new("ResultFileMissing")
+    }
+
+    return $fullPath
+}
+
+function Read-TranscriptResultFileText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $fullPath = Resolve-TranscriptResultFilePath -Path $Path
+    $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    return [System.IO.File]::ReadAllText($fullPath, $utf8)
+}
+
+function Get-TranscriptExplorerSelectArgument {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $fullPath = Resolve-TranscriptResultFilePath -Path $Path
+    return '/select,"{0}"' -f $fullPath
+}
+
 Export-ModuleMember -Function @(
     "Get-TranscriptProjectNameValidation",
     "Get-TranscriptProjectNames",
@@ -314,5 +354,8 @@ Export-ModuleMember -Function @(
     "New-TranscriptQueueState",
     "Get-TranscriptQueueCurrentItem",
     "Move-TranscriptQueueNext",
-    "Get-TranscriptQueueSummary"
+    "Get-TranscriptQueueSummary",
+    "Resolve-TranscriptResultFilePath",
+    "Read-TranscriptResultFileText",
+    "Get-TranscriptExplorerSelectArgument"
 )

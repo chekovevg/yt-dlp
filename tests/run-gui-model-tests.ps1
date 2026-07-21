@@ -327,6 +327,52 @@ $tests = @(
         }
     },
     @{
+        Name = "Result file actions resolve, read, and select the saved transcript"
+        Run = {
+            $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+                "transcript-gui-model-tests-" + [Guid]::NewGuid().ToString("N")
+            )
+
+            try {
+                New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
+                $resultPath = Join-Path $testRoot "result transcript.txt"
+                $expectedText = "alpha " + [char]0x20AC
+                [System.IO.File]::WriteAllText(
+                    $resultPath,
+                    $expectedText,
+                    [System.Text.UTF8Encoding]::new($false)
+                )
+
+                $resolvedPath = Resolve-TranscriptResultFilePath -Path $resultPath
+                Assert-Equal `
+                    $resolvedPath `
+                    ([System.IO.Path]::GetFullPath($resultPath)) `
+                    "Result file path was not canonicalized."
+                Assert-Equal `
+                    (Read-TranscriptResultFileText -Path $resultPath) `
+                    $expectedText `
+                    "Result file contents were not read as UTF-8."
+                Assert-Equal `
+                    (Get-TranscriptExplorerSelectArgument -Path $resultPath) `
+                    ('/select,"{0}"' -f ([System.IO.Path]::GetFullPath($resultPath))) `
+                    "Explorer select argument changed."
+
+                Assert-ThrowsMessage `
+                    -Action {
+                        Resolve-TranscriptResultFilePath `
+                            -Path (Join-Path $testRoot "missing.txt")
+                    } `
+                    -ExpectedMessage "ResultFileMissing" `
+                    -Message "A missing result file was accepted."
+            }
+            finally {
+                if (Test-Path -LiteralPath $testRoot) {
+                    Remove-Item -LiteralPath $testRoot -Recurse -Force
+                }
+            }
+        }
+    },
+    @{
         Name = "Queue state continues after failure and reports totals"
         Run = {
             $items = @(

@@ -137,8 +137,6 @@ function Set-TranscriptUiBusy {
     $script:view.RootBox.Enabled = -not $Busy
     $script:view.BrowseButton.Enabled = -not $Busy
     $script:view.LanguageBox.Enabled = -not $Busy
-    $script:view.OpenRootButton.Enabled = -not $Busy
-    $script:view.CopyRootPathButton.Enabled = -not $Busy
 
     foreach ($card in $script:cards) {
         $card.UrlBox.Enabled = -not $Busy
@@ -146,7 +144,11 @@ function Set-TranscriptUiBusy {
         $card.ProjectBox.Enabled = -not $Busy
         $card.CreateProjectButton.Enabled = -not $Busy
         $card.RemoveButton.Enabled = -not $Busy
-        $card.CopyTextButton.Enabled = -not $Busy
+        $card.ResultContextMenu.Enabled = (
+            -not $Busy -and
+            $card.State -eq "Success" -and
+            -not [string]::IsNullOrWhiteSpace([string]$card.TextPath)
+        )
         $card.RetryButton.Enabled = -not $Busy
     }
 
@@ -214,6 +216,7 @@ function Remove-TranscriptCard {
     $script:view.VideoList.Controls.Remove($Card.Container)
     [void]$script:cards.Remove($Card)
     $Card.ToolTip.Dispose()
+    $Card.ResultContextMenu.Dispose()
     $Card.Container.Dispose()
     Renumber-TranscriptCards
 }
@@ -245,7 +248,27 @@ function Create-TranscriptProjectForCard {
     }
 }
 
-function Copy-TranscriptCardText {
+function Set-TranscriptCardResultActionError {
+    param(
+        [Parameter(Mandatory = $true)][object]$Card,
+        [Parameter(Mandatory = $true)][System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $isMissing = $ErrorRecord.Exception.Message -eq "ResultFileMissing"
+    $message = if ($isMissing) {
+        $script:uiText.ResultFileMissing
+    }
+    else {
+        $script:uiText.ResultActionFailedFormat -f $ErrorRecord.Exception.Message
+    }
+
+    Set-TranscriptVideoCardState -Card $Card -State "Success" -Message $message
+    if ($isMissing) {
+        $Card.ResultContextMenu.Enabled = $false
+    }
+}
+
+function Copy-TranscriptCardPath {
     param([Parameter(Mandatory = $true)][object]$Card)
 
     if ($script:isBusy -or -not $Card.TextPath) {
@@ -253,7 +276,27 @@ function Copy-TranscriptCardText {
     }
 
     try {
-        $text = Get-Content -LiteralPath $Card.TextPath -Raw -Encoding UTF8
+        $path = Resolve-TranscriptResultFilePath -Path $Card.TextPath
+        [System.Windows.Forms.Clipboard]::SetText($path)
+        Set-TranscriptVideoCardState `
+            -Card $Card `
+            -State "Success" `
+            -Message $script:uiText.PathCopied
+    }
+    catch {
+        Set-TranscriptCardResultActionError -Card $Card -ErrorRecord $_
+    }
+}
+
+function Copy-TranscriptCardContents {
+    param([Parameter(Mandatory = $true)][object]$Card)
+
+    if ($script:isBusy -or -not $Card.TextPath) {
+        return
+    }
+
+    try {
+        $text = Read-TranscriptResultFileText -Path $Card.TextPath
         [System.Windows.Forms.Clipboard]::SetText($text)
         Set-TranscriptVideoCardState `
             -Card $Card `
@@ -261,10 +304,27 @@ function Copy-TranscriptCardText {
             -Message $script:uiText.TextCopied
     }
     catch {
+        Set-TranscriptCardResultActionError -Card $Card -ErrorRecord $_
+    }
+}
+
+function Show-TranscriptCardInExplorer {
+    param([Parameter(Mandatory = $true)][object]$Card)
+
+    if ($script:isBusy -or -not $Card.TextPath) {
+        return
+    }
+
+    try {
+        $argument = Get-TranscriptExplorerSelectArgument -Path $Card.TextPath
+        Start-Process -FilePath "explorer.exe" -ArgumentList @($argument)
         Set-TranscriptVideoCardState `
             -Card $Card `
             -State "Success" `
-            -Message ($script:uiText.CopyFailedFormat -f $_.Exception.Message)
+            -Message $script:uiText.ShownInExplorer
+    }
+    catch {
+        Set-TranscriptCardResultActionError -Card $Card -ErrorRecord $_
     }
 }
 
@@ -297,8 +357,14 @@ function Add-TranscriptVideoCard {
     $card.CreateProjectButton.Add_Click({
         Create-TranscriptProjectForCard -Card $eventCard
     }.GetNewClosure())
-    $card.CopyTextButton.Add_Click({
-        Copy-TranscriptCardText -Card $eventCard
+    $card.CopyPathMenuItem.Add_Click({
+        Copy-TranscriptCardPath -Card $eventCard
+    }.GetNewClosure())
+    $card.CopyContentsMenuItem.Add_Click({
+        Copy-TranscriptCardContents -Card $eventCard
+    }.GetNewClosure())
+    $card.ShowInExplorerMenuItem.Add_Click({
+        Show-TranscriptCardInExplorer -Card $eventCard
     }.GetNewClosure())
     $card.RetryButton.Add_Click({
         Start-TranscriptCardRetry -Card $eventCard
@@ -413,6 +479,7 @@ function Complete-CurrentTranscriptQueueItem {
             -Card $card `
             -State "Success" `
             -Message ($script:uiText.SuccessFileFormat -f ([System.IO.Path]::GetFileName($card.TextPath)))
+        $card.ResultContextMenu.Enabled = -not $script:isBusy
     }
     else {
         $card.TextPath = $null
@@ -784,28 +851,6 @@ $script:view.RootBox.Add_Leave({
 
 $script:view.SaveQueueButton.Add_Click({
     Start-AllTranscriptCards
-})
-
-$script:view.OpenRootButton.Add_Click({
-    try {
-        $rootPath = Ensure-TranscriptRootDirectory
-        Start-Process explorer.exe -ArgumentList @($rootPath)
-    }
-    catch {
-        Set-TranscriptGlobalStatus -Text $_.Exception.Message
-    }
-})
-
-$script:view.CopyRootPathButton.Add_Click({
-    try {
-        $rootPath = Ensure-TranscriptRootDirectory
-        [System.Windows.Forms.Clipboard]::SetText($rootPath)
-        Set-TranscriptGlobalStatus -Text $script:uiText.PathCopied
-    }
-    catch {
-        Set-TranscriptGlobalStatus `
-            -Text ($script:uiText.CopyFailedFormat -f $_.Exception.Message)
-    }
 })
 
 $script:view.VideoList.Add_SizeChanged({

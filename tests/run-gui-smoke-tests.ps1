@@ -147,10 +147,32 @@ try {
         }
     }
 
+    function Assert-UiElementMissing {
+        param(
+            [Parameter(Mandatory = $true)]
+            [System.Windows.Automation.AutomationElement]$RootElement,
+
+            [Parameter(Mandatory = $true)]
+            [string]$Name
+        )
+
+        $condition = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::NameProperty,
+            $Name
+        )
+        $element = $RootElement.FindFirst(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $condition
+        )
+        if ($element) {
+            throw "GUI still exposes removed automation element '$Name'."
+        }
+    }
+
     Assert-UiElement -RootElement $window -Name $uiText.AddVideo
     Assert-UiElement -RootElement $window -Name $uiText.SaveVideos
-    Assert-UiElement -RootElement $window -Name $uiText.OpenRoot
-    Assert-UiElement -RootElement $window -Name $uiText.CopyRootPath
+    Assert-UiElementMissing -RootElement $window -Name $uiText.OpenRoot
+    Assert-UiElementMissing -RootElement $window -Name $uiText.CopyRootPath
     Assert-UiElement -RootElement $window -Name $uiText.ClearGlyph
     Assert-UiElement -RootElement $window -Name $uiText.NoProject
 

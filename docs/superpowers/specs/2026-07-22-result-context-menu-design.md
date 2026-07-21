@@ -28,7 +28,7 @@ The menu is unavailable before a transcript exists, while processing, and after 
 - Remove the footer `Открыть папку` and `Скопировать путь` buttons.
 - Keep `Сохранить видео` as the only footer action.
 - Keep `Повторить` visible on failed cards because retry is a primary recovery action, not a file action.
-- Attach the same context menu to the card container and its child controls so the hit area is the whole visual cell.
+- Attach the same context menu to the card background, layout surfaces, heading, and status. Keep native right-click behavior on editable inputs and buttons.
 
 ## Error handling
 

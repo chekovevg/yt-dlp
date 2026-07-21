@@ -27,6 +27,29 @@ function New-TranscriptChoiceItem {
     }
 }
 
+function Set-TranscriptResultContextMenu {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Windows.Forms.Control]$Control,
+
+        [Parameter(Mandatory = $true)]
+        [System.Windows.Forms.ContextMenuStrip]$ContextMenu
+    )
+
+    $isInteractiveControl = (
+        $Control -is [System.Windows.Forms.Button] -or
+        $Control -is [System.Windows.Forms.TextBox] -or
+        $Control -is [System.Windows.Forms.ComboBox]
+    )
+    if (-not $isInteractiveControl) {
+        $Control.ContextMenuStrip = $ContextMenu
+    }
+
+    foreach ($child in $Control.Controls) {
+        Set-TranscriptResultContextMenu -Control $child -ContextMenu $ContextMenu
+    }
+}
+
 function Set-TranscriptChoiceByValue {
     param(
         [Parameter(Mandatory = $true)]
@@ -231,7 +254,7 @@ function New-TranscriptVideoCardView {
 
     $statusRow = New-Object System.Windows.Forms.TableLayoutPanel
     $statusRow.AutoSize = $true
-    $statusRow.ColumnCount = 3
+    $statusRow.ColumnCount = 2
     $statusRow.Dock = [System.Windows.Forms.DockStyle]::Fill
     $statusRow.Margin = New-Object System.Windows.Forms.Padding(0)
     [void]$statusRow.ColumnStyles.Add(
@@ -240,10 +263,6 @@ function New-TranscriptVideoCardView {
     [void]$statusRow.ColumnStyles.Add(
         [System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::AutoSize)
     )
-    [void]$statusRow.ColumnStyles.Add(
-        [System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::AutoSize)
-    )
-
     $statusLabel = New-Object System.Windows.Forms.Label
     $statusLabel.AccessibleName = $UiText.Idle
     $statusLabel.AutoEllipsis = $true
@@ -253,15 +272,6 @@ function New-TranscriptVideoCardView {
     $statusLabel.Text = $UiText.Idle
     $statusRow.Controls.Add($statusLabel, 0, 0)
 
-    $copyTextButton = New-Object System.Windows.Forms.Button
-    $copyTextButton.AccessibleName = $UiText.CopyText
-    $copyTextButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
-    $copyTextButton.AutoSize = $true
-    $copyTextButton.Margin = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
-    $copyTextButton.Text = $UiText.CopyText
-    $copyTextButton.Visible = $false
-    $statusRow.Controls.Add($copyTextButton, 1, 0)
-
     $retryButton = New-Object System.Windows.Forms.Button
     $retryButton.AccessibleName = $UiText.Retry
     $retryButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
@@ -269,8 +279,30 @@ function New-TranscriptVideoCardView {
     $retryButton.Margin = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
     $retryButton.Text = $UiText.Retry
     $retryButton.Visible = $false
-    $statusRow.Controls.Add($retryButton, 2, 0)
+    $statusRow.Controls.Add($retryButton, 1, 0)
     $container.Controls.Add($statusRow, 0, 2)
+
+    $resultContextMenu = New-Object System.Windows.Forms.ContextMenuStrip
+    $resultContextMenu.Enabled = $false
+
+    $copyPathMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem
+    $copyPathMenuItem.AccessibleName = $UiText.CopyResultPath
+    $copyPathMenuItem.Text = $UiText.CopyResultPath
+    [void]$resultContextMenu.Items.Add($copyPathMenuItem)
+
+    $copyContentsMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem
+    $copyContentsMenuItem.AccessibleName = $UiText.CopyResultContents
+    $copyContentsMenuItem.Text = $UiText.CopyResultContents
+    [void]$resultContextMenu.Items.Add($copyContentsMenuItem)
+
+    $showInExplorerMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem
+    $showInExplorerMenuItem.AccessibleName = $UiText.ShowResultInExplorer
+    $showInExplorerMenuItem.Text = $UiText.ShowResultInExplorer
+    [void]$resultContextMenu.Items.Add($showInExplorerMenuItem)
+
+    Set-TranscriptResultContextMenu `
+        -Control $container `
+        -ContextMenu $resultContextMenu
 
     $card = [pscustomobject]@{
         Id = [Guid]::NewGuid().ToString("N")
@@ -286,7 +318,19 @@ function New-TranscriptVideoCardView {
         CreateProjectButton = $createProjectButton
         RemoveButton = $removeButton
         StatusLabel = $statusLabel
-        CopyTextButton = $copyTextButton
+        CopyTextButton = $null
+        ResultContextMenu = $resultContextMenu
+        CopyPathMenuItem = $copyPathMenuItem
+        CopyContentsMenuItem = $copyContentsMenuItem
+        ShowInExplorerMenuItem = $showInExplorerMenuItem
+        ResultContextInteractiveTargets = @(
+            $urlBox,
+            $clearButton,
+            $projectBox,
+            $createProjectButton,
+            $removeButton,
+            $retryButton
+        )
         RetryButton = $retryButton
         ToolTip = $toolTip
     }
@@ -334,7 +378,22 @@ function Set-TranscriptVideoCardState {
     else {
         [string]$defaultMessage
     }
-    $Card.CopyTextButton.Visible = ($State -eq "Success")
+    $Card.ResultContextMenu.Enabled = ($State -eq "Success")
+    $interactiveContextMenu = if ($State -eq "Success") {
+        $Card.ResultContextMenu
+    }
+    else {
+        $null
+    }
+    foreach ($control in $Card.ResultContextInteractiveTargets) {
+        $control.ContextMenuStrip = $interactiveContextMenu
+    }
+    $Card.Container.AccessibleDescription = if ($State -eq "Success") {
+        $Card.UiText.ResultContextHint
+    }
+    else {
+        ""
+    }
     $Card.RetryButton.Visible = ($State -eq "Error")
 }
 
@@ -522,21 +581,6 @@ function New-TranscriptMainView {
     $saveQueueButton.Text = $UiText.SaveVideos
     [void]$footerActions.Controls.Add($saveQueueButton)
 
-    $openRootButton = New-Object System.Windows.Forms.Button
-    $openRootButton.AccessibleName = $UiText.OpenRoot
-    $openRootButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
-    $openRootButton.AutoSize = $true
-    $openRootButton.Margin = New-Object System.Windows.Forms.Padding(0, 0, 10, 0)
-    $openRootButton.Text = $UiText.OpenRoot
-    [void]$footerActions.Controls.Add($openRootButton)
-
-    $copyRootPathButton = New-Object System.Windows.Forms.Button
-    $copyRootPathButton.AccessibleName = $UiText.CopyRootPath
-    $copyRootPathButton.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
-    $copyRootPathButton.AutoSize = $true
-    $copyRootPathButton.Margin = New-Object System.Windows.Forms.Padding(0)
-    $copyRootPathButton.Text = $UiText.CopyRootPath
-    [void]$footerActions.Controls.Add($copyRootPathButton)
     $footer.Controls.Add($footerActions, 0, 0)
 
     $globalStatusLabel = New-Object System.Windows.Forms.Label
@@ -559,8 +603,8 @@ function New-TranscriptMainView {
         CardCountLabel = $cardCountLabel
         VideoList = $videoList
         SaveQueueButton = $saveQueueButton
-        OpenRootButton = $openRootButton
-        CopyRootPathButton = $copyRootPathButton
+        OpenRootButton = $null
+        CopyRootPathButton = $null
         GlobalStatusLabel = $globalStatusLabel
         KeepSubtitlesBox = $null
     }
