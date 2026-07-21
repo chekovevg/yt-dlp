@@ -114,8 +114,8 @@ YouTube Transcript Tool
 6. Use `+ Добавить видео` to add up to six cards. Empty cards are ignored.
 7. Click `Сохранить видео`. Filled cards are processed from top to bottom.
 8. If one video fails, later cards continue. Correct the failed card and click `Повторить`.
-9. Use `Скопировать текст` on a completed card to copy its transcript.
-10. Use the footer actions to open the root folder or copy its path.
+9. Right-click a completed card to open its transcript-file menu.
+10. Choose `Скопировать путь`, `Скопировать содержимое файла`, or `Показать в проводнике`.
 
 The desktop app saves only readable `.txt` transcripts. The command-line `-KeepSubs` option remains available when the original subtitle file is needed.
 
@@ -193,7 +193,7 @@ Updates are manual; the app does not update in the background and does not provi
 6. Choose a shared language and click `Сохранить видео`.
 7. Confirm filled cards run top-to-bottom and the empty card is ignored.
 8. Confirm every successful card creates one `.txt` in the expected folder.
-9. Confirm `Скопировать текст`, `Открыть папку`, and `Скопировать путь` work.
+9. Right-click a successful card and confirm all three file actions work: copy path, copy file contents, and show the exact file in Explorer.
 10. Include one failing link and confirm later cards continue and `Повторить` appears.
 
 ## Developer Checks
