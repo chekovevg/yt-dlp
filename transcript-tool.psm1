@@ -1,9 +1,12 @@
-$script:SupportedTranscriptLanguages = @("auto", "ru", "en", "de")
+$script:MinimumYtDlpVersion = [version]"2026.7.4"
+$script:ValidatedYtDlpVersions = @{}
 
 if (-not ("TranscriptFileCleanupTools" -as [type])) {
     Add-Type @'
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 
@@ -16,6 +19,7 @@ public static class TranscriptFileCleanupTools
     private const uint FILE_SHARE_DELETE = 0x00000004;
     private const uint OPEN_EXISTING = 3;
     private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    private const uint TH32CS_SNAPPROCESS = 0x00000002;
     private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
 
     public static FileStream OpenDeleteOnCloseLock(string path)
@@ -75,6 +79,64 @@ public static class TranscriptFileCleanupTools
         finally { CloseHandle(handle); }
     }
 
+    public static void KillProcessTree(int rootProcessId)
+    {
+        IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot == INVALID_HANDLE_VALUE)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not inspect the timed-out process tree.");
+        }
+
+        List<PROCESSENTRY32> entries = new List<PROCESSENTRY32>();
+        try
+        {
+            PROCESSENTRY32 entry = new PROCESSENTRY32();
+            entry.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+            if (Process32First(snapshot, ref entry))
+            {
+                do
+                {
+                    entries.Add(entry);
+                    entry.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+                }
+                while (Process32Next(snapshot, ref entry));
+            }
+        }
+        finally { CloseHandle(snapshot); }
+
+        List<int> tree = new List<int>();
+        tree.Add(rootProcessId);
+        bool added;
+        do
+        {
+            added = false;
+            foreach (PROCESSENTRY32 entry in entries)
+            {
+                int processId = unchecked((int)entry.th32ProcessID);
+                int parentId = unchecked((int)entry.th32ParentProcessID);
+                if (!tree.Contains(processId) && tree.Contains(parentId))
+                {
+                    tree.Add(processId);
+                    added = true;
+                }
+            }
+        }
+        while (added);
+
+        for (int index = tree.Count - 1; index >= 0; index--)
+        {
+            try
+            {
+                using (Process process = Process.GetProcessById(tree[index]))
+                {
+                    process.Kill();
+                }
+            }
+            catch (ArgumentException) { }
+            catch (InvalidOperationException) { }
+        }
+    }
+
     private static IntPtr OpenIdentityHandle(string path, uint access)
     {
         IntPtr handle = CreateFile(
@@ -125,6 +187,22 @@ public static class TranscriptFileCleanupTools
         public bool DeleteFile;
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct PROCESSENTRY32
+    {
+        public uint dwSize;
+        public uint cntUsage;
+        public uint th32ProcessID;
+        public IntPtr th32DefaultHeapID;
+        public uint th32ModuleID;
+        public uint cntThreads;
+        public uint th32ParentProcessID;
+        public int pcPriClassBase;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szExeFile;
+    }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr CreateFile(
         string fileName,
@@ -147,6 +225,15 @@ public static class TranscriptFileCleanupTools
         ref FILE_DISPOSITION_INFO information,
         uint size);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool Process32First(IntPtr snapshot, ref PROCESSENTRY32 entry);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool Process32Next(IntPtr snapshot, ref PROCESSENTRY32 entry);
+
     [DllImport("kernel32.dll")]
     private static extern bool CloseHandle(IntPtr handle);
 }
@@ -166,7 +253,6 @@ function Get-TranscriptSettingsPath {
 function Get-DefaultTranscriptSettings {
     [pscustomobject]@{
         OutputDir = Join-Path (Get-TranscriptToolRoot) "texts"
-        Language = "auto"
         KeepSubtitles = $false
     }
 }
@@ -186,10 +272,6 @@ function Read-TranscriptSettings {
             $defaults.OutputDir = [string]$saved.OutputDir
         }
 
-        if ($saved.Language -and $script:SupportedTranscriptLanguages -contains [string]$saved.Language) {
-            $defaults.Language = [string]$saved.Language
-        }
-
         $defaults.KeepSubtitles = [bool]$saved.KeepSubtitles
     }
     catch {
@@ -204,16 +286,11 @@ function Write-TranscriptSettings {
         [Parameter(Mandatory = $true)]
         [string]$OutputDir,
 
-        [Parameter(Mandatory = $true)]
-        [ValidateSet("auto", "ru", "en", "de")]
-        [string]$Language,
-
         [bool]$KeepSubtitles
     )
 
     $settings = [pscustomobject]@{
         OutputDir = $OutputDir
-        Language = $Language
         KeepSubtitles = $KeepSubtitles
     }
 
@@ -225,21 +302,80 @@ function Get-YtDlpPath {
         [string]$PreferredPath
     )
 
-    if ($PreferredPath -and (Test-Path -LiteralPath $PreferredPath)) {
-        return $PreferredPath
+    if ($PreferredPath) {
+        if (-not (Test-Path -LiteralPath $PreferredPath -PathType Leaf)) {
+            throw "yt-dlp.exe was not found at the explicitly selected test path."
+        }
+
+        $resolvedPreferredPath = (Resolve-Path -LiteralPath $PreferredPath).Path
+        Assert-YtDlpVersionContract -YtDlpPath $resolvedPreferredPath
+        return $resolvedPreferredPath
     }
 
     $local = Join-Path (Get-TranscriptToolRoot) "yt-dlp.exe"
-    if (Test-Path -LiteralPath $local) {
-        return $local
+    if (Test-Path -LiteralPath $local -PathType Leaf) {
+        $resolvedLocalPath = (Resolve-Path -LiteralPath $local).Path
+        Assert-YtDlpVersionContract -YtDlpPath $resolvedLocalPath
+        return $resolvedLocalPath
     }
 
-    $command = Get-Command yt-dlp.exe -ErrorAction SilentlyContinue
-    if ($command) {
-        return $command.Source
+    throw "yt-dlp.exe was not found. Put the supported bundled yt-dlp.exe next to this tool."
+}
+
+function Get-ManagedYtDlpArguments {
+    param(
+        [AllowEmptyCollection()]
+        [string[]]$ArgumentList = @()
+    )
+
+    return @("--ignore-config", "--no-plugin-dirs") + @($ArgumentList)
+}
+
+function Assert-YtDlpVersionText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    $trimmed = $Version.Trim()
+    if ($trimmed -notmatch '^(\d{4})\.(\d{2})\.(\d{2})$') {
+        throw "UnsupportedYtDlpContract: yt-dlp 2026.07.04 or newer stable version is required."
     }
 
-    throw "yt-dlp.exe was not found. Put yt-dlp.exe next to this tool or install yt-dlp and add it to PATH."
+    try {
+        $parsed = [version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+    }
+    catch {
+        throw "UnsupportedYtDlpContract: yt-dlp returned an invalid stable version."
+    }
+
+    if ($parsed -lt $script:MinimumYtDlpVersion) {
+        throw "UnsupportedYtDlpContract: yt-dlp 2026.07.04 or newer stable version is required."
+    }
+}
+
+function Assert-YtDlpVersionContract {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$YtDlpPath
+    )
+
+    $cacheKey = [System.IO.Path]::GetFullPath($YtDlpPath).ToLowerInvariant()
+    if ($script:ValidatedYtDlpVersions.ContainsKey($cacheKey)) {
+        return
+    }
+
+    $result = Invoke-TranscriptProcess `
+        -FilePath $YtDlpPath `
+        -ArgumentList (Get-ManagedYtDlpArguments -ArgumentList @("--version")) `
+        -TimeoutMilliseconds 10000
+    if ($result.TimedOut -or $result.ExitCode -ne 0) {
+        throw "UnsupportedYtDlpContract: could not verify the bundled yt-dlp version."
+    }
+
+    $version = @($result.StdOut -split '[\r\n]+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)[0]
+    Assert-YtDlpVersionText -Version ([string]$version)
+    $script:ValidatedYtDlpVersions[$cacheKey] = [string]$version
 }
 
 function Test-YoutubeUrl {
@@ -342,8 +478,17 @@ function Invoke-TranscriptProcess {
             if (-not $process.WaitForExit($TimeoutMilliseconds)) {
                 $timedOut = $true
                 $taskkillPath = Join-Path ([System.Environment]::SystemDirectory) 'taskkill.exe'
+                $nativeTreeKillSucceeded = $false
 
-                if (Test-Path -LiteralPath $taskkillPath -PathType Leaf) {
+                try {
+                    [TranscriptFileCleanupTools]::KillProcessTree($process.Id)
+                    $nativeTreeKillSucceeded = $true
+                }
+                catch {
+                    $nativeTreeKillSucceeded = $false
+                }
+
+                if (-not $nativeTreeKillSucceeded -and (Test-Path -LiteralPath $taskkillPath -PathType Leaf)) {
                     $taskkillStartInfo = New-Object System.Diagnostics.ProcessStartInfo
                     $taskkillStartInfo.FileName = $taskkillPath
                     $taskkillStartInfo.Arguments = "/PID $($process.Id) /T /F"
@@ -366,7 +511,7 @@ function Invoke-TranscriptProcess {
                     }
                 }
 
-                if (-not $process.WaitForExit(5000)) {
+                if (-not $process.WaitForExit(2000)) {
                     $process.Kill()
                     [void]$process.WaitForExit(1000)
                 }
@@ -479,6 +624,49 @@ function Invoke-TranscriptWorkerProcess {
     }
 }
 
+function Assert-YtDlpMetadataContract {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Info
+    )
+
+    foreach ($propertyName in @("subtitles", "automatic_captions", "formats")) {
+        if (-not $Info.PSObject.Properties[$propertyName]) {
+            throw "UnsupportedYtDlpContract: metadata is missing '$propertyName'."
+        }
+    }
+
+    foreach ($mapName in @("subtitles", "automatic_captions")) {
+        $map = $Info.$mapName
+        if ($null -eq $map) {
+            continue
+        }
+        if ($map -isnot [pscustomobject]) {
+            throw "UnsupportedYtDlpContract: metadata '$mapName' is not a language-track map."
+        }
+
+        foreach ($property in $map.PSObject.Properties) {
+            if ($property.Value -isnot [System.Array]) {
+                throw "UnsupportedYtDlpContract: metadata '$mapName.$($property.Name)' is not a format array."
+            }
+            foreach ($format in @($property.Value)) {
+                if ($null -eq $format -or $format -isnot [pscustomobject]) {
+                    throw "UnsupportedYtDlpContract: metadata '$mapName.$($property.Name)' contains an invalid format."
+                }
+            }
+        }
+    }
+
+    if ($Info.formats -isnot [System.Array]) {
+        throw "UnsupportedYtDlpContract: metadata 'formats' is not an array."
+    }
+    foreach ($format in @($Info.formats)) {
+        if ($null -eq $format -or $format -isnot [pscustomobject]) {
+            throw "UnsupportedYtDlpContract: metadata 'formats' contains an invalid entry."
+        }
+    }
+}
+
 function Invoke-YtDlpJson {
     param(
         [Parameter(Mandatory = $true)]
@@ -494,11 +682,13 @@ function Invoke-YtDlpJson {
         [int]$MaxAttempts = 2
     )
 
+    Assert-YtDlpVersionContract -YtDlpPath $YtDlpPath
+
     $result = $null
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         $result = Invoke-TranscriptProcess `
             -FilePath $YtDlpPath `
-            -ArgumentList @('--skip-download', '--dump-single-json', '--no-warnings', '--no-playlist', $Url) `
+            -ArgumentList (Get-ManagedYtDlpArguments -ArgumentList @('--skip-download', '--dump-single-json', '--no-warnings', '--no-playlist', $Url)) `
             -TimeoutMilliseconds $TimeoutMilliseconds
 
         if (-not $result.TimedOut) {
@@ -534,161 +724,365 @@ function Invoke-YtDlpJson {
     }
 
     try {
-        return ($result.StdOut | ConvertFrom-Json)
+        $info = $result.StdOut | ConvertFrom-Json
+        Assert-YtDlpMetadataContract -Info $info
+        return $info
     }
     catch {
+        if ($_.Exception.Message -match '^UnsupportedYtDlpContract:') {
+            throw $_
+        }
         throw "yt-dlp returned metadata that this tool could not read."
     }
 }
 
-function Get-SubtitleMapLanguages {
+function ConvertTo-TranscriptLanguageIdentity {
     param(
-        [object]$Map
+        [AllowNull()]
+        [string]$RawTrackTag
     )
 
-    if (-not $Map) {
-        return @()
+    if ([string]::IsNullOrWhiteSpace($RawTrackTag)) {
+        return $null
     }
 
-    $languages = foreach ($property in $Map.PSObject.Properties) {
-        if ($property.Name -eq "live_chat") {
-            continue
-        }
-
-        $formats = @($property.Value)
-        $hasTranscriptFormat = @($formats | Where-Object {
-                $_ -and ([string]$_.ext).ToLowerInvariant() -in @("vtt", "srt")
-            }).Count -gt 0
-        if (-not $hasTranscriptFormat) {
-            continue
-        }
-
-        $property.Name
+    $normalized = $RawTrackTag.Trim().Replace("_", "-")
+    $canonicalInput = $normalized -replace '(?i)-orig$', ''
+    if ($canonicalInput -notmatch '^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$') {
+        return $null
     }
 
-    return @($languages | Sort-Object)
+    $parts = @($canonicalInput -split '-')
+    $base = $parts[0].ToLowerInvariant()
+    if ($base -in @("und", "mul", "zxx")) {
+        return $null
+    }
+
+    $canonicalParts = New-Object System.Collections.Generic.List[string]
+    $canonicalParts.Add($base)
+    for ($index = 1; $index -lt $parts.Count; $index++) {
+        $part = $parts[$index]
+        if ($part -match '^[A-Za-z]{4}$') {
+            $canonicalParts.Add($part.Substring(0, 1).ToUpperInvariant() + $part.Substring(1).ToLowerInvariant())
+        }
+        elseif ($part -match '^[A-Za-z]{2}$' -or $part -match '^\d{3}$') {
+            $canonicalParts.Add($part.ToUpperInvariant())
+        }
+        else {
+            $canonicalParts.Add($part.ToLowerInvariant())
+        }
+    }
+
+    return [pscustomobject]@{
+        RawTrackTag = $RawTrackTag
+        CanonicalLanguageTag = ($canonicalParts -join "-")
+        BaseLanguage = $base
+    }
 }
 
-function Get-AvailableTranscriptLanguages {
+function Get-TranscriptEligibleRepresentations {
+    param(
+        [AllowNull()]
+        [object]$Formats
+    )
+
+    $eligible = foreach ($format in @($Formats)) {
+        if (-not $format) {
+            continue
+        }
+
+        $extension = ([string]$format.ext).Trim().ToLowerInvariant()
+        if ($extension -notin @("vtt", "srt")) {
+            continue
+        }
+
+        $uri = $null
+        if (-not [System.Uri]::TryCreate(([string]$format.url).Trim(), [System.UriKind]::Absolute, [ref]$uri)) {
+            continue
+        }
+        if ($uri.Scheme -notin @("http", "https")) {
+            continue
+        }
+
+        $protocol = ([string]$format.protocol).Trim().ToLowerInvariant()
+        if ($protocol -and $protocol -notin @("http", "https")) {
+            continue
+        }
+
+        [pscustomobject]@{
+            Extension = $extension
+            Url = $uri.AbsoluteUri
+        }
+    }
+
+    return @($eligible | Sort-Object @{ Expression = { if ($_.Extension -eq "vtt") { 0 } else { 1 } } }, Url)
+}
+
+function Get-TranscriptSubtitleTracks {
     param(
         [Parameter(Mandatory = $true)]
         [object]$Info
     )
 
-    $manual = @(Get-SubtitleMapLanguages -Map $Info.subtitles)
-    $auto = @(Get-SubtitleMapLanguages -Map $Info.automatic_captions)
+    $tracks = New-Object System.Collections.Generic.List[object]
+    foreach ($sourceDefinition in @(
+            [pscustomobject]@{ Map = $Info.subtitles; SourceKind = "Manual" },
+            [pscustomobject]@{ Map = $Info.automatic_captions; SourceKind = "Automatic" }
+        )) {
+        if (-not $sourceDefinition.Map) {
+            continue
+        }
 
-    $all = @($manual + $auto) | Sort-Object -Unique
+        foreach ($property in $sourceDefinition.Map.PSObject.Properties) {
+            $identity = ConvertTo-TranscriptLanguageIdentity -RawTrackTag $property.Name
+            $representations = @(Get-TranscriptEligibleRepresentations -Formats $property.Value)
+            $sourceKind = if ($property.Name -eq "live_chat") {
+                "ExcludedService"
+            }
+            elseif ($sourceDefinition.SourceKind -eq "Automatic" -and $property.Name -notmatch '(?i)-orig$') {
+                "AutomaticUntrusted"
+            }
+            elseif ($sourceDefinition.SourceKind -eq "Automatic") {
+                "AutomaticOriginal"
+            }
+            else {
+                "Manual"
+            }
 
-    [pscustomobject]@{
-        Manual = $manual
-        Auto = $auto
-        All = $all
+            if (-not $identity -or $representations.Count -eq 0) {
+                continue
+            }
+
+            $tracks.Add([pscustomobject]@{
+                RawTrackTag = $identity.RawTrackTag
+                CanonicalLanguageTag = $identity.CanonicalLanguageTag
+                BaseLanguage = $identity.BaseLanguage
+                SourceKind = $sourceKind
+                PreferredExtension = $representations[0].Extension
+                Representations = $representations
+            })
+        }
     }
+
+    return @($tracks.ToArray())
 }
 
-function Get-LanguageCandidates {
+function Get-TranscriptSubtitleInventory {
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet("ru", "en", "de")]
-        [string]$Language
+        [object]$Info
     )
 
-    if ($Language -eq "ru") {
-        return @("ru-orig", "ru", "ru-RU")
-    }
-
-    if ($Language -eq "en") {
-        return @("en-orig", "en", "en-GB", "en-US")
-    }
-
-    return @("de-orig", "de", "de-DE")
+    Assert-YtDlpMetadataContract -Info $Info
+    return @(
+        Get-TranscriptSubtitleTracks -Info $Info |
+            Sort-Object SourceKind, RawTrackTag
+    )
 }
 
-function Find-LanguageTag {
+function Get-TranscriptAudioLanguageIdentities {
     param(
+        [Parameter(Mandatory = $true)]
+        [object]$Info,
+
+        [int]$LanguagePreference,
+
+        [switch]$AnyNonDescriptive
+    )
+
+    $identities = foreach ($format in @($Info.formats)) {
+        if (-not $format -or [string]::IsNullOrWhiteSpace([string]$format.acodec) -or ([string]$format.acodec) -eq "none") {
+            continue
+        }
+
+        $preference = 0
+        $hasPreference = [int]::TryParse([string]$format.language_preference, [ref]$preference)
+        if ($AnyNonDescriptive) {
+            if ($hasPreference -and $preference -eq -10) {
+                continue
+            }
+        }
+        elseif (-not $hasPreference -or $preference -ne $LanguagePreference) {
+            continue
+        }
+
+        $identity = ConvertTo-TranscriptLanguageIdentity -RawTrackTag ([string]$format.language)
+        if ($identity) {
+            $identity
+        }
+    }
+
+    return @($identities | Sort-Object CanonicalLanguageTag -Unique)
+}
+
+function Get-TranscriptOriginalLanguageEvidence {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Info,
+
+        [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
-        [string[]]$AvailableTags = @(),
-
-        [Parameter(Mandatory = $true)]
-        [string]$Language
+        [object[]]$Tracks
     )
 
-    foreach ($candidate in (Get-LanguageCandidates -Language $Language)) {
-        if ($AvailableTags -contains $candidate) {
-            return $candidate
+    $automaticEvidence = @($Tracks |
+        Where-Object SourceKind -eq "AutomaticOriginal" |
+        Sort-Object CanonicalLanguageTag -Unique)
+    $originalAudio = @(Get-TranscriptAudioLanguageIdentities -Info $Info -LanguagePreference 10)
+
+    if ($automaticEvidence.Count -gt 1 -or $originalAudio.Count -gt 1) {
+        throw "OriginalLanguageAmbiguous: multiple original-language signals were found."
+    }
+    if ($automaticEvidence.Count -eq 1 -and $originalAudio.Count -eq 1 -and
+        $automaticEvidence[0].BaseLanguage -ne $originalAudio[0].BaseLanguage) {
+        throw "OriginalLanguageAmbiguous: caption and audio evidence disagree."
+    }
+
+    if ($automaticEvidence.Count -eq 1) {
+        return [pscustomobject]@{
+            CanonicalLanguageTag = $automaticEvidence[0].CanonicalLanguageTag
+            BaseLanguage = $automaticEvidence[0].BaseLanguage
+            Tier = "AutomaticOriginal"
+        }
+    }
+    if ($originalAudio.Count -eq 1) {
+        return [pscustomobject]@{
+            CanonicalLanguageTag = $originalAudio[0].CanonicalLanguageTag
+            BaseLanguage = $originalAudio[0].BaseLanguage
+            Tier = "OriginalAudio"
         }
     }
 
-    $languagePattern = "^{0}(-|$)" -f [regex]::Escape($Language)
-    foreach ($tag in $AvailableTags) {
-        if ($tag -match $languagePattern) {
-            return $tag
+    $defaultAudio = @(Get-TranscriptAudioLanguageIdentities -Info $Info -LanguagePreference 5)
+    if ($defaultAudio.Count -gt 1) {
+        throw "OriginalLanguageAmbiguous: multiple default-audio languages were found."
+    }
+    if ($defaultAudio.Count -eq 1) {
+        return [pscustomobject]@{
+            CanonicalLanguageTag = $defaultAudio[0].CanonicalLanguageTag
+            BaseLanguage = $defaultAudio[0].BaseLanguage
+            Tier = "DefaultAudio"
         }
     }
 
+    $otherAudio = @(Get-TranscriptAudioLanguageIdentities -Info $Info -AnyNonDescriptive)
+    $otherBases = @($otherAudio | Select-Object -ExpandProperty BaseLanguage -Unique)
+    if ($otherBases.Count -eq 1) {
+        $sameBase = @($otherAudio | Where-Object BaseLanguage -eq $otherBases[0])
+        return [pscustomobject]@{
+            CanonicalLanguageTag = if ($sameBase.Count -eq 1) { $sameBase[0].CanonicalLanguageTag } else { $otherBases[0] }
+            BaseLanguage = $otherBases[0]
+            Tier = "UniqueAudio"
+        }
+    }
+    if ($otherBases.Count -gt 1) {
+        throw "OriginalLanguageAmbiguous: multiple audio languages were found."
+    }
+
+    return $null
+}
+
+function New-TranscriptSubtitleChoice {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Track,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Confirmed", "Presumed")]
+        [string]$Confidence
+    )
+
+    $warningCode = if ($Track.SourceKind -eq "AutomaticOriginal") {
+        "AutomaticOriginalAccuracy"
+    }
+    elseif ($Confidence -eq "Presumed") {
+        "ManualLanguageUnconfirmed"
+    }
+    else {
+        $null
+    }
+
+    return [pscustomobject]@{
+        RawTrackTag = $Track.RawTrackTag
+        CanonicalLanguageTag = $Track.CanonicalLanguageTag
+        BaseLanguage = $Track.BaseLanguage
+        SourceKind = $Track.SourceKind
+        Confidence = $Confidence
+        WarningCode = $warningCode
+        PreferredExtension = $Track.PreferredExtension
+    }
+}
+
+function Resolve-TranscriptTrackStage {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Tracks,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StageDescription
+    )
+
+    if ($Tracks.Count -gt 1) {
+        $tags = @($Tracks | Select-Object -ExpandProperty RawTrackTag | Sort-Object) -join ", "
+        throw "OriginalSubtitleAmbiguous: multiple $StageDescription tracks match ($tags)."
+    }
+    if ($Tracks.Count -eq 1) {
+        return $Tracks[0]
+    }
     return $null
 }
 
 function Resolve-TranscriptSubtitleChoice {
     param(
         [Parameter(Mandatory = $true)]
-        [object]$Info,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Preference
+        [object]$Info
     )
 
-    $available = Get-AvailableTranscriptLanguages -Info $Info
+    $tracks = @(Get-TranscriptSubtitleTracks -Info $Info)
+    $selectable = @($tracks | Where-Object SourceKind -in @("Manual", "AutomaticOriginal"))
+    $manual = @($selectable | Where-Object SourceKind -eq "Manual")
+    $automatic = @($selectable | Where-Object SourceKind -eq "AutomaticOriginal")
 
-    if ($available.All.Count -eq 0) {
-        throw "No subtitles or auto-generated captions were found for this video."
+    if ($selectable.Count -eq 0) {
+        if (@($tracks | Where-Object SourceKind -eq "AutomaticUntrusted").Count -gt 0) {
+            throw "NoVerifiedOriginalSubtitle: only untrusted automatic caption tracks are available."
+        }
+        throw "NoSubtitleTracks: no eligible subtitle tracks were found."
     }
 
-    $preferenceOrder = if ($Preference -eq "auto") {
-        @("ru", "en", "de")
-    }
-    else {
-        @($Preference)
+    $evidence = Get-TranscriptOriginalLanguageEvidence -Info $Info -Tracks $tracks
+
+    if (-not $evidence) {
+        if ($manual.Count -eq 1) {
+            return New-TranscriptSubtitleChoice -Track $manual[0] -Confidence "Presumed"
+        }
+        if ($manual.Count -gt 1) {
+            throw "OriginalSubtitleAmbiguous: multiple manual tracks exist without original-language evidence."
+        }
+        if (@($tracks | Where-Object SourceKind -eq "AutomaticUntrusted").Count -gt 0) {
+            throw "NoVerifiedOriginalSubtitle: only untrusted automatic caption tracks are available."
+        }
+        throw "NoSubtitleTracks: no eligible subtitle tracks were found."
     }
 
-    foreach ($language in $preferenceOrder) {
-        $manualTag = Find-LanguageTag -AvailableTags $available.Manual -Language $language
-        if ($manualTag) {
-            return [pscustomobject]@{
-                Language = $language
-                Tag = $manualTag
-                Source = "manual"
-                Available = $available
-            }
+    foreach ($sourceTracks in @($manual, $automatic)) {
+        $exact = Resolve-TranscriptTrackStage `
+            -Tracks @($sourceTracks | Where-Object CanonicalLanguageTag -eq $evidence.CanonicalLanguageTag) `
+            -StageDescription "exact-language"
+        if ($exact) {
+            return New-TranscriptSubtitleChoice -Track $exact -Confidence "Confirmed"
         }
 
-        $autoTag = Find-LanguageTag -AvailableTags $available.Auto -Language $language
-        if ($autoTag) {
-            return [pscustomobject]@{
-                Language = $language
-                Tag = $autoTag
-                Source = "auto"
-                Available = $available
-            }
-        }
-    }
-
-    if ($Preference -eq "auto") {
-        $tag = @($available.Manual + $available.Auto | Select-Object -First 1)[0]
-        $source = if ($available.Manual -contains $tag) { "manual" } else { "auto" }
-        $language = ($tag -split "-")[0]
-
-        return [pscustomobject]@{
-            Language = $language
-            Tag = $tag
-            Source = $source
-            Available = $available
+        $sameBase = Resolve-TranscriptTrackStage `
+            -Tracks @($sourceTracks | Where-Object BaseLanguage -eq $evidence.BaseLanguage) `
+            -StageDescription "same-base"
+        if ($sameBase) {
+            return New-TranscriptSubtitleChoice -Track $sameBase -Confidence "Confirmed"
         }
     }
 
-    $list = if ($available.All.Count -gt 0) { $available.All -join ", " } else { "none" }
-    throw "Selected subtitle language '$Preference' is not available. Available subtitle languages: $list"
+    throw "NoVerifiedOriginalSubtitle: no eligible subtitle track matches the original language."
 }
 
 function New-SafeFilePart {
@@ -1362,175 +1756,6 @@ function Save-TranscriptFromSubtitleFile {
     }
 }
 
-function Get-CliSubtitleLanguageTags {
-    param(
-        [Parameter(Mandatory = $true)]
-        [ValidateSet("ru", "en", "de")]
-        [string]$Language
-    )
-
-    if ($Language -eq "ru") {
-        return @("ru-orig", "ru")
-    }
-
-    if ($Language -eq "en") {
-        return @("en-orig", "en", "en-GB", "en-US")
-    }
-
-    return @("de-orig", "de")
-}
-
-function Resolve-CliPreferredLanguage {
-    param(
-        [AllowNull()]
-        [string]$Language
-    )
-
-    if ($Language -match '^ru') {
-        return "ru"
-    }
-
-    if ($Language -match '^en') {
-        return "en"
-    }
-
-    if ($Language -match '^de') {
-        return "de"
-    }
-
-    return $null
-}
-
-function Get-CliVideoLanguage {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$YtDlpPath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Url
-    )
-
-    try {
-        $result = Invoke-TranscriptProcess -FilePath $YtDlpPath -ArgumentList @(
-            "--skip-download", "--print", "%(language)s", $Url
-        )
-
-        if ($result.ExitCode -eq 0) {
-            $language = @($result.StdOut -split '[\r\n]+' | Where-Object { $_ } | Select-Object -First 1)[0]
-            if ($language -and $language -ne "NA") {
-                return $language.Trim().ToLowerInvariant()
-            }
-        }
-    }
-    catch {
-        return $null
-    }
-
-    return $null
-}
-
-function Get-CliSubtitleLanguagePlan {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Url,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Preference,
-
-        [string]$SubtitleLanguages,
-
-        [Parameter(Mandatory = $true)]
-        [string]$YtDlpPath
-    )
-
-    if ($SubtitleLanguages) {
-        $preferred = if ($Preference -ne "auto") { $Preference } else { $null }
-        return [pscustomobject]@{
-            Attempts = @($SubtitleLanguages)
-            PreferredLanguage = $preferred
-        }
-    }
-
-    if ($Preference -ne "auto") {
-        return [pscustomobject]@{
-            Attempts = @(Get-CliSubtitleLanguageTags -Language $Preference)
-            PreferredLanguage = $Preference
-        }
-    }
-
-    $detected = Resolve-CliPreferredLanguage -Language (Get-CliVideoLanguage -YtDlpPath $YtDlpPath -Url $Url)
-    $languages = New-Object System.Collections.Generic.List[string]
-    if ($detected) {
-        $languages.Add($detected)
-    }
-
-    foreach ($fallback in @("ru", "en", "de")) {
-        if (-not $languages.Contains($fallback)) {
-            $languages.Add($fallback)
-        }
-    }
-
-    $attempts = @(
-        foreach ($language in $languages) {
-            Get-CliSubtitleLanguageTags -Language $language
-        }
-    )
-
-    return [pscustomobject]@{
-        Attempts = $attempts
-        PreferredLanguage = $detected
-    }
-}
-
-function Get-CliSubtitlePriority {
-    param(
-        [Parameter(Mandatory = $true)]
-        [System.IO.FileInfo]$File,
-
-        [AllowNull()]
-        [string]$PreferredLanguage
-    )
-
-    $name = $File.Name.ToLowerInvariant()
-    $priority = if ($PreferredLanguage -eq "en") {
-        @("en-orig", "en", "ru", "ru-orig", "de-orig", "de")
-    }
-    elseif ($PreferredLanguage -eq "ru") {
-        @("ru-orig", "ru", "en", "en-orig", "de-orig", "de")
-    }
-    elseif ($PreferredLanguage -eq "de") {
-        @("de-orig", "de", "en", "en-orig", "ru", "ru-orig")
-    }
-    else {
-        @("ru-orig", "ru", "en-orig", "en", "de-orig", "de")
-    }
-
-    for ($i = 0; $i -lt $priority.Count; $i++) {
-        $tag = [regex]::Escape($priority[$i])
-        if ($name -match "\.$tag\.(vtt|srt)$") {
-            return $i
-        }
-    }
-
-    return 9
-}
-
-function Select-CliPreferredSubtitleFile {
-    param(
-        [Parameter(Mandatory = $true)]
-        [System.IO.FileInfo[]]$Subtitles,
-
-        [AllowNull()]
-        [string]$PreferredLanguage
-    )
-
-    return $Subtitles |
-        Sort-Object `
-            @{ Expression = { Get-CliSubtitlePriority -File $_ -PreferredLanguage $PreferredLanguage }; Ascending = $true },
-            @{ Expression = { $_.LastWriteTimeUtc }; Descending = $true } |
-        Select-Object -First 1
-}
-
 function Get-BoundedTranscriptDiagnostic {
     param(
         [AllowNull()]
@@ -1551,6 +1776,59 @@ function Get-BoundedTranscriptDiagnostic {
     return $diagnostic.Substring($diagnostic.Length - $MaximumLength)
 }
 
+function New-TranscriptSubtitleDownloadArguments {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Choice,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputTemplate,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Url,
+
+        [switch]$Srt
+    )
+
+    $sourceFlag = switch ($Choice.SourceKind) {
+        "Manual" { "--write-subs" }
+        "AutomaticOriginal" { "--write-auto-subs" }
+        default { throw "UnsupportedYtDlpContract: unsupported selected subtitle source '$($Choice.SourceKind)'." }
+    }
+
+    $arguments = @(
+        "--skip-download",
+        "--no-playlist",
+        "--extractor-args", "youtube:skip=translated_subs",
+        "--sub-langs", [string]$Choice.RawTrackTag,
+        "--sub-format", "vtt/srt",
+        $sourceFlag
+    )
+    if ($Srt) {
+        $arguments += @("--convert-subs", "srt")
+    }
+    $arguments += @("-o", $OutputTemplate, $Url)
+
+    return @(Get-ManagedYtDlpArguments -ArgumentList $arguments)
+}
+
+function ConvertTo-CanonicalSubtitleStem {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Stem,
+
+        [Parameter(Mandatory = $true)]
+        [object]$Choice
+    )
+
+    $rawSuffix = "." + [string]$Choice.RawTrackTag
+    if ($Stem.EndsWith($rawSuffix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $Stem.Substring(0, $Stem.Length - $rawSuffix.Length) + "." + [string]$Choice.CanonicalLanguageTag
+    }
+
+    return $Stem + "." + [string]$Choice.CanonicalLanguageTag
+}
+
 function Save-TranscriptFromYoutubeCli {
     param(
         [Parameter(Mandatory = $true)]
@@ -1558,11 +1836,6 @@ function Save-TranscriptFromYoutubeCli {
 
         [Parameter(Mandatory = $true)]
         [string]$OutputDir,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Preference,
-
-        [string]$SubtitleLanguages,
 
         [bool]$NoClean,
 
@@ -1574,20 +1847,14 @@ function Save-TranscriptFromYoutubeCli {
 
         [string]$YtDlpPath,
 
-        [scriptblock]$OnAttempt,
-
         [string]$OperationId
     )
 
     $tool = Get-YtDlpPath -PreferredPath $YtDlpPath
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
     $operation = New-TranscriptOperationId -OperationId $OperationId
-
-    $plan = Get-CliSubtitleLanguagePlan `
-        -Url $Url `
-        -Preference $Preference `
-        -SubtitleLanguages $SubtitleLanguages `
-        -YtDlpPath $tool
+    $info = Invoke-YtDlpJson -YtDlpPath $tool -Url $Url
+    $choice = Resolve-TranscriptSubtitleChoice -Info $info
 
     $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("youtube-transcript-cli-" + [System.Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
@@ -1598,48 +1865,20 @@ function Save-TranscriptFromYoutubeCli {
     $lastStdErr = ""
 
     try {
-        for ($attemptIndex = 0; $attemptIndex -lt $plan.Attempts.Count; $attemptIndex++) {
-            $subtitleLanguages = $plan.Attempts[$attemptIndex]
-            $attemptDir = Join-Path $tempDir ("attempt-{0:D2}" -f $attemptIndex)
-            New-Item -ItemType Directory -Path $attemptDir -Force | Out-Null
-
-            if ($OnAttempt) {
-                & $OnAttempt $subtitleLanguages | Out-Null
-            }
-
-            $arguments = @(
-                "--skip-download",
-                "--write-subs",
-                "--write-auto-subs",
-                "--sub-langs", $subtitleLanguages
-            )
-
-            if ($Srt) {
-                $arguments += @("--sub-format", "srt/best", "--convert-subs", "srt")
-            }
-            else {
-                $arguments += @("--sub-format", "vtt/best")
-            }
-
-            $arguments += @(
-                "-o", (Join-Path $attemptDir "%(title)s [%(id)s].%(ext)s"),
-                $Url
-            )
-
-            $downloadResult = Invoke-TranscriptProcess `
-                -FilePath $tool `
-                -ArgumentList $arguments `
-                -WorkingDirectory $attemptDir
-            $lastExitCode = $downloadResult.ExitCode
-            $lastOutput = Get-BoundedTranscriptDiagnostic -Text ([string]$downloadResult.Output)
-            $lastStdErr = Get-BoundedTranscriptDiagnostic -Text ([string]$downloadResult.StdErr)
-            $downloadedSubtitles = @(Get-ChildItem -LiteralPath $attemptDir -File |
-                Where-Object { $_.Extension -in ".vtt", ".srt" })
-
-            if ($downloadedSubtitles.Count -gt 0) {
-                break
-            }
-        }
+        $arguments = New-TranscriptSubtitleDownloadArguments `
+            -Choice $choice `
+            -OutputTemplate (Join-Path $tempDir "%(title)s [%(id)s].%(ext)s") `
+            -Url $Url `
+            -Srt:$Srt
+        $downloadResult = Invoke-TranscriptProcess `
+            -FilePath $tool `
+            -ArgumentList $arguments `
+            -WorkingDirectory $tempDir
+        $lastExitCode = $downloadResult.ExitCode
+        $lastOutput = Get-BoundedTranscriptDiagnostic -Text ([string]$downloadResult.Output)
+        $lastStdErr = Get-BoundedTranscriptDiagnostic -Text ([string]$downloadResult.StdErr)
+        $downloadedSubtitles = @(Get-ChildItem -LiteralPath $tempDir -File |
+            Where-Object { $_.Extension -in ".vtt", ".srt" })
 
         if ($downloadedSubtitles.Count -eq 0) {
             return [pscustomobject]@{
@@ -1652,6 +1891,12 @@ function Save-TranscriptFromYoutubeCli {
                 YtDlpExitCode = $lastExitCode
                 Output = $lastOutput
                 StdErr = $lastStdErr
+                RawTrackTag = $choice.RawTrackTag
+                CanonicalLanguageTag = $choice.CanonicalLanguageTag
+                BaseLanguage = $choice.BaseLanguage
+                SourceKind = $choice.SourceKind
+                Confidence = $choice.Confidence
+                WarningCode = $choice.WarningCode
             }
         }
 
@@ -1666,7 +1911,7 @@ function Save-TranscriptFromYoutubeCli {
                     Select-Object -Unique)
                 $reservation = New-TranscriptOutputReservation `
                     -OutputDir $OutputDir `
-                    -Stem ([string]$subtitleGroup.Name) `
+                    -Stem (ConvertTo-CanonicalSubtitleStem -Stem ([string]$subtitleGroup.Name) -Choice $choice) `
                     -ArtifactSuffixes $relatedSuffixes `
                     -OperationId $operation
                 $groupSucceeded = $false
@@ -1698,13 +1943,23 @@ function Save-TranscriptFromYoutubeCli {
                 YtDlpExitCode = $lastExitCode
                 Output = $lastOutput
                 StdErr = $lastStdErr
+                RawTrackTag = $choice.RawTrackTag
+                CanonicalLanguageTag = $choice.CanonicalLanguageTag
+                BaseLanguage = $choice.BaseLanguage
+                SourceKind = $choice.SourceKind
+                Confidence = $choice.Confidence
+                WarningCode = $choice.WarningCode
             }
         }
 
-        $selected = Select-CliPreferredSubtitleFile `
-            -Subtitles $downloadedSubtitles `
-            -PreferredLanguage $plan.PreferredLanguage
-        $selectedStem = [System.IO.Path]::GetFileNameWithoutExtension($selected.Name)
+        $selected = $downloadedSubtitles |
+            Sort-Object `
+                @{ Expression = { if ($Srt -and $_.Extension -eq ".srt") { 0 } elseif (-not $Srt -and $_.Extension -eq ".vtt") { 0 } else { 1 } }; Ascending = $true },
+                @{ Expression = { $_.FullName }; Ascending = $true } |
+            Select-Object -First 1
+        $selectedStem = ConvertTo-CanonicalSubtitleStem `
+            -Stem ([System.IO.Path]::GetFileNameWithoutExtension($selected.Name)) `
+            -Choice $choice
         $artifactSuffixes = @(
             if ($CleanTranscript) {
                 ".clean.txt"
@@ -1758,6 +2013,12 @@ function Save-TranscriptFromYoutubeCli {
             YtDlpExitCode = $lastExitCode
             Output = $lastOutput
             StdErr = $lastStdErr
+            RawTrackTag = $choice.RawTrackTag
+            CanonicalLanguageTag = $choice.CanonicalLanguageTag
+            BaseLanguage = $choice.BaseLanguage
+            SourceKind = $choice.SourceKind
+            Confidence = $choice.Confidence
+            WarningCode = $choice.WarningCode
         }
     }
     finally {
@@ -1776,10 +2037,6 @@ function Save-TranscriptFromYoutube {
 
         [Parameter(Mandatory = $true)]
         [string]$OutputDir,
-
-        [Parameter(Mandatory = $true)]
-        [ValidateSet("auto", "ru", "en", "de")]
-        [string]$Language,
 
         [bool]$KeepSubtitles,
 
@@ -1819,28 +2076,16 @@ function Save-TranscriptFromYoutube {
     $info = Invoke-YtDlpJson -YtDlpPath $tool -Url $Url
 
     if ($OnStatus) { & $OnStatus "Looking for subtitles" }
-    $choice = Resolve-TranscriptSubtitleChoice -Info $info -Preference $Language
+    $choice = Resolve-TranscriptSubtitleChoice -Info $info
 
     $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("youtube-transcript-tool-" + $operation)
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
     try {
-        $args = @(
-            "--skip-download",
-            "--no-playlist",
-            "--sub-langs", $choice.Tag,
-            "--sub-format", "vtt/best",
-            "-o", (Join-Path $tempDir "%(id)s.%(ext)s")
-        )
-
-        if ($choice.Source -eq "manual") {
-            $args += "--write-subs"
-        }
-        else {
-            $args += "--write-auto-subs"
-        }
-
-        $args += $Url
+        $args = New-TranscriptSubtitleDownloadArguments `
+            -Choice $choice `
+            -OutputTemplate (Join-Path $tempDir "%(id)s.%(ext)s") `
+            -Url $Url
 
         if ($OnStatus) { & $OnStatus "Saving file" }
         $downloadResult = Invoke-TranscriptProcess -FilePath $tool -ArgumentList $args
@@ -1863,12 +2108,12 @@ function Save-TranscriptFromYoutube {
         }
 
         if (-not $subtitleFile) {
-            throw "yt-dlp did not produce a subtitle file for the selected language."
+            throw "yt-dlp did not produce a subtitle file for the selected original track."
         }
 
         $videoTitle = if ($info.title) { [string]$info.title } else { "video" }
         $videoId = if ($info.id) { [string]$info.id } else { [System.Guid]::NewGuid().ToString("N") }
-        $fileName = New-TranscriptFileName -Title $videoTitle -VideoId $videoId -Language $choice.Language
+        $fileName = New-TranscriptFileName -Title $videoTitle -VideoId $videoId -Language $choice.CanonicalLanguageTag
         $outputStemName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
         $artifactSuffixes = @(".txt")
         if ($KeepSubtitles) {
@@ -1912,12 +2157,14 @@ function Save-TranscriptFromYoutube {
             TextPath = $txtPath
             SubtitlePath = $subtitlePath
             OutputDir = $OutputDir
-            Language = $choice.Language
-            SubtitleTag = $choice.Tag
-            Source = $choice.Source
+            RawTrackTag = $choice.RawTrackTag
+            CanonicalLanguageTag = $choice.CanonicalLanguageTag
+            BaseLanguage = $choice.BaseLanguage
+            SourceKind = $choice.SourceKind
+            Confidence = $choice.Confidence
+            WarningCode = $choice.WarningCode
             Title = $videoTitle
             VideoId = $videoId
-            AvailableLanguages = $choice.Available.All
         }
     }
     catch {
@@ -1940,6 +2187,7 @@ Export-ModuleMember -Function @(
     "Invoke-TranscriptProcess",
     "Invoke-TranscriptWorkerProcess",
     "Invoke-YtDlpJson",
+    "Get-TranscriptSubtitleInventory",
     "Get-AvailableTranscriptLanguages",
     "Resolve-TranscriptSubtitleChoice",
     "New-TranscriptFileName",

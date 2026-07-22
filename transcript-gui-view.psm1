@@ -265,7 +265,7 @@ function New-TranscriptVideoCardView {
     )
     $statusLabel = New-Object System.Windows.Forms.Label
     $statusLabel.AccessibleName = $UiText.Idle
-    $statusLabel.AutoEllipsis = $true
+    $statusLabel.AutoEllipsis = $false
     $statusLabel.AutoSize = $true
     $statusLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
     $statusLabel.Margin = New-Object System.Windows.Forms.Padding(0, 7, 8, 0)
@@ -280,6 +280,24 @@ function New-TranscriptVideoCardView {
     $retryButton.Text = $UiText.Retry
     $retryButton.Visible = $false
     $statusRow.Controls.Add($retryButton, 1, 0)
+
+    $resizeStatusLabel = {
+        $retryWidth = if ($retryButton.Visible) {
+            $retryButton.Width + $retryButton.Margin.Horizontal
+        }
+        else {
+            0
+        }
+        $availableStatusWidth = [Math]::Max(
+            100,
+            $statusRow.ClientSize.Width - $retryWidth - $statusLabel.Margin.Horizontal
+        )
+        if ($statusLabel.MaximumSize.Width -ne $availableStatusWidth) {
+            $statusLabel.MaximumSize = [System.Drawing.Size]::new($availableStatusWidth, 0)
+        }
+    }.GetNewClosure()
+    $statusRow.add_ClientSizeChanged($resizeStatusLabel)
+    & $resizeStatusLabel
     $container.Controls.Add($statusRow, 0, 2)
 
     $resultContextMenu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -350,6 +368,31 @@ function Set-TranscriptVideoCardIndex {
     $Card.RemoveButton.Visible = ($Index -gt 1)
 }
 
+function Get-TranscriptCompletedMessage {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$UiText,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TextPath,
+
+        [AllowNull()]
+        [string]$WarningCode
+    )
+
+    $message = $UiText.SuccessFileFormat -f ([System.IO.Path]::GetFileName($TextPath))
+    $warning = switch ($WarningCode) {
+        "AutomaticOriginalAccuracy" { [string]$UiText.WarningAutomaticOriginal }
+        "ManualLanguageUnconfirmed" { [string]$UiText.WarningManualUnconfirmed }
+        default { "" }
+    }
+
+    if ($warning) {
+        return $message + [System.Environment]::NewLine + $warning
+    }
+    return $message
+}
+
 function Set-TranscriptVideoCardState {
     param(
         [Parameter(Mandatory = $true)]
@@ -378,6 +421,7 @@ function Set-TranscriptVideoCardState {
     else {
         [string]$defaultMessage
     }
+    $Card.StatusLabel.AccessibleName = $Card.StatusLabel.Text
     $Card.ResultContextMenu.Enabled = ($State -eq "Success")
     $interactiveContextMenu = if ($State -eq "Success") {
         $Card.ResultContextMenu
@@ -454,7 +498,7 @@ function New-TranscriptMainView {
     $settingsLayout.ColumnCount = 3
     $settingsLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
     $settingsLayout.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 14)
-    $settingsLayout.RowCount = 2
+    $settingsLayout.RowCount = 1
     [void]$settingsLayout.ColumnStyles.Add(
         [System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::AutoSize)
     )
@@ -487,30 +531,6 @@ function New-TranscriptMainView {
     $browseButton.Text = $UiText.Browse
     $settingsLayout.Controls.Add($browseButton, 2, 0)
 
-    $languageLabel = New-Object System.Windows.Forms.Label
-    $languageLabel.AutoSize = $true
-    $languageLabel.Margin = New-Object System.Windows.Forms.Padding(0, 7, 12, 0)
-    $languageLabel.Text = $UiText.Language
-    $settingsLayout.Controls.Add($languageLabel, 0, 1)
-
-    $languageBox = New-Object System.Windows.Forms.ComboBox
-    $languageBox.AccessibleName = $UiText.Language
-    $languageBox.AccessibleRole = [System.Windows.Forms.AccessibleRole]::ComboBox
-    $languageBox.DisplayMember = "Label"
-    $languageBox.Dock = [System.Windows.Forms.DockStyle]::Left
-    $languageBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-    $languageBox.Margin = New-Object System.Windows.Forms.Padding(0, 3, 0, 0)
-    $languageBox.Width = 210
-    foreach ($choice in @(
-            (New-TranscriptChoiceItem -Label $UiText.LanguageAuto -Value "auto"),
-            (New-TranscriptChoiceItem -Label $UiText.LanguageRu -Value "ru"),
-            (New-TranscriptChoiceItem -Label $UiText.LanguageEn -Value "en"),
-            (New-TranscriptChoiceItem -Label $UiText.LanguageDe -Value "de")
-        )) {
-        [void]$languageBox.Items.Add($choice)
-    }
-    [void](Set-TranscriptChoiceByValue -ComboBox $languageBox -Value ([string]$Settings.Language))
-    $settingsLayout.Controls.Add($languageBox, 1, 1)
     $rootLayout.Controls.Add($settingsLayout, 0, 1)
 
     $videosHeader = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -598,7 +618,6 @@ function New-TranscriptMainView {
         RootLayout = $rootLayout
         RootBox = $rootBox
         BrowseButton = $browseButton
-        LanguageBox = $languageBox
         AddVideoButton = $addVideoButton
         CardCountLabel = $cardCountLabel
         VideoList = $videoList
@@ -734,6 +753,7 @@ Export-ModuleMember -Function @(
     "Get-TranscriptUiText",
     "New-TranscriptMainView",
     "New-TranscriptVideoCardView",
+    "Get-TranscriptCompletedMessage",
     "Set-TranscriptVideoCardIndex",
     "Set-TranscriptVideoCardProjects",
     "Set-TranscriptVideoCardState",

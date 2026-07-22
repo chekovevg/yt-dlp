@@ -33,6 +33,14 @@ using System.Linq;
 using System.Text;
 
 public class Program {
+    private static void LogInvocation(string[] args) {
+        var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "yt-dlp-invocations.txt");
+        using (var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+        using (var writer = new StreamWriter(stream, new UTF8Encoding(false))) {
+            writer.WriteLine(String.Join("|", args));
+        }
+    }
+
     private static string GetOutputDirectory(string[] args) {
         var outputIndex = Array.IndexOf(args, "-o");
         if (outputIndex < 0 || outputIndex + 1 >= args.Length) {
@@ -58,6 +66,31 @@ public class Program {
     }
 
     public static int Main(string[] args) {
+        var isolated = args.Length >= 2 && args[0] == "--ignore-config" && args[1] == "--no-plugin-dirs";
+        LogInvocation(args);
+        if (args.Contains("--version")) {
+            if (!isolated) return 12;
+            Console.WriteLine("2026.07.04");
+            return 0;
+        }
+
+        var url = args.Length == 0 ? "" : args[args.Length - 1];
+        if (args.Contains("--dump-single-json")) {
+            if (!isolated) return 12;
+            if (url.Contains("list-fixture")) {
+                Console.WriteLine("{\"id\":\"list\",\"title\":\"List\",\"subtitles\":{\"en\":[{\"ext\":\"vtt\",\"url\":\"https://example.test/en.vtt\",\"protocol\":\"https\"}],\"live_chat\":[{\"ext\":\"vtt\",\"url\":\"https://example.test/chat.vtt\",\"protocol\":\"https\"}]},\"automatic_captions\":{\"en-orig\":[{\"ext\":\"vtt\",\"url\":\"https://example.test/en-auto.vtt\",\"protocol\":\"https\"}],\"ru\":[{\"ext\":\"vtt\",\"url\":\"https://example.test/ru.vtt\",\"protocol\":\"https\"}]},\"formats\":[{\"acodec\":\"opus\",\"language\":\"en\",\"language_preference\":10}]}");
+                return 0;
+            }
+            if (url.Contains("automatic-warning")) {
+                Console.WriteLine("{\"id\":\"automatic\",\"title\":\"Automatic\",\"subtitles\":{},\"automatic_captions\":{\"en-orig\":[{\"ext\":\"vtt\",\"url\":\"https://example.test/en-auto.vtt\",\"protocol\":\"https\"}],\"ru\":[{\"ext\":\"vtt\",\"url\":\"https://example.test/ru.vtt\",\"protocol\":\"https\"}]},\"formats\":[{\"acodec\":\"opus\",\"language\":\"en\",\"language_preference\":10}]}");
+                return 0;
+            }
+
+            var language = url.Contains("german-video") || url.Contains("prefer-german") ? "de" : (url.Contains("option-run") ? "custom-lang" : "en");
+            Console.WriteLine("{\"id\":\"fixture\",\"title\":\"Fixture\",\"subtitles\":{\"" + language + "\":[{\"ext\":\"vtt\",\"url\":\"https://example.test/manual.vtt\",\"protocol\":\"https\"}]},\"automatic_captions\":{},\"formats\":[{\"acodec\":\"opus\",\"language\":\"" + language + "\",\"language_preference\":10}]}");
+            return 0;
+        }
+
         if (args.Contains("--print")) {
             var printUrl = args.Length == 0 ? "" : args[args.Length - 1];
             if (printUrl.Contains("unknown-language")) {
@@ -78,8 +111,6 @@ public class Program {
             Console.WriteLine("en, ru");
             return 0;
         }
-
-        var url = args.Length == 0 ? "" : args[args.Length - 1];
 
         if (url.Contains("all-attempts-fail")) {
             Console.Error.WriteLine("ERROR: synthetic all-attempt diagnostic");
@@ -129,6 +160,14 @@ public class Program {
                 args,
                 "Fresh [fresh].en.vtt",
                 "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nFresh &amp; clean\n");
+            return 0;
+        }
+
+        if (url.Contains("automatic-warning")) {
+            WriteSubtitle(
+                args,
+                "Automatic [automatic].en-orig.vtt",
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nAutomatic subtitle\n");
             return 0;
         }
 
@@ -227,9 +266,14 @@ function Invoke-DownloadSubs {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
-    $psi.EnvironmentVariables["PATH"] = $Directory + [System.IO.Path]::PathSeparator + $psi.EnvironmentVariables["PATH"]
-
-    $process = [System.Diagnostics.Process]::Start($psi)
+    $originalPath = $env:PATH
+    try {
+        $env:PATH = $Directory + [System.IO.Path]::PathSeparator + $originalPath
+        $process = [System.Diagnostics.Process]::Start($psi)
+    }
+    finally {
+        $env:PATH = $originalPath
+    }
     $stdout = $process.StandardOutput.ReadToEnd()
     $stderr = $process.StandardError.ReadToEnd()
     $process.WaitForExit()
@@ -291,6 +335,82 @@ function Get-CliTestTemporaryDirectories {
 
 $tests = @(
     @{
+        Name = "Original CLI rejects legacy language overrides before download"
+        Run = {
+            $dir = New-TestWorkspace
+            try {
+                foreach ($arguments in @(
+                        @("https://example.test/fresh", "-Prefer", "ru"),
+                        @("https://example.test/fresh", "-Langs", "en")
+                    )) {
+                    $result = Invoke-DownloadSubs -Directory $dir -Arguments $arguments
+                    Assert-True ($result.ExitCode -ne 0) "Legacy language override unexpectedly succeeded."
+                    Assert-True ($result.Output -match [regex]::Escape("-Prefer and -Langs are no longer supported. Online downloads always use the video's original language.")) "Expected bounded migration guidance, got: $($result.Output)"
+                }
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "Original CLI List uses isolated metadata classification without download"
+        Run = {
+            $dir = New-TestWorkspace
+            try {
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("-List", "https://example.test/list-fixture")
+                Assert-True ($result.ExitCode -eq 0) "Expected successful metadata listing, got: $($result.Output)"
+                foreach ($expected in @("en`tManual", "en-orig`tAutomaticOriginal", "ru`tAutomaticUntrusted", "live_chat`tExcludedService")) {
+                    Assert-True ($result.Output -match [regex]::Escape($expected)) "Missing classified track '$expected': $($result.Output)"
+                }
+
+                $invocations = @(Get-Content -LiteralPath (Join-Path $dir "yt-dlp-invocations.txt"))
+                Assert-True (@($invocations | Where-Object { $_ -match '--dump-single-json' }).Count -eq 1) "List did not use exactly one metadata probe."
+                Assert-True (@($invocations | Where-Object { $_ -match '--write-(auto-)?subs' }).Count -eq 0) "List attempted a subtitle download."
+                Assert-True (@($invocations | Where-Object { $_ -match '--list-subs' }).Count -eq 0) "List bypassed the managed metadata inventory."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "Original CLI successful automatic captions emit accuracy warning with exit zero"
+        Run = {
+            $dir = New-TestWorkspace
+            try {
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("https://example.test/automatic-warning")
+                Assert-True ($result.ExitCode -eq 0) "ASR warning was treated as a failure: $($result.Output)"
+                Assert-True ($result.Output -match "ошибки распознавания") "Expected ASR accuracy warning, got: $($result.Output)"
+                Assert-True (Test-Path -LiteralPath (Join-Path $dir "texts\Automatic [automatic].en.txt")) "Expected canonical ASR transcript filename."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
+        Name = "Original CLI CleanOnly selects newest subtitle without language priority"
+        Run = {
+            $dir = New-TestWorkspace
+            try {
+                $older = Join-Path $dir "Older.en.vtt"
+                $newer = Join-Path $dir "Newer.ja.vtt"
+                Set-Content -LiteralPath $older -Encoding utf8 -Value "WEBVTT`n`n00:00:00.000 --> 00:00:01.000`nOLDER"
+                Set-Content -LiteralPath $newer -Encoding utf8 -Value "WEBVTT`n`n00:00:00.000 --> 00:00:01.000`nNEWER"
+                [System.IO.File]::SetLastWriteTimeUtc($older, [datetime]"2026-01-01T00:00:00Z")
+                [System.IO.File]::SetLastWriteTimeUtc($newer, [datetime]"2026-01-02T00:00:00Z")
+
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("-CleanOnly")
+                Assert-True ($result.ExitCode -eq 0) "Expected CleanOnly success, got: $($result.Output)"
+                Assert-True (Test-Path -LiteralPath (Join-Path $dir "texts\Newer.ja.txt")) "CleanOnly retained obsolete language priority."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    },
+    @{
         Name = "CleanOnly without subtitle files reports the intended error"
         Run = {
             $dir = New-TestWorkspace
@@ -317,7 +437,7 @@ $tests = @(
                     "Tom &amp; Jerry&nbsp;&quot;hi&quot;"
                 )
 
-                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("-CleanOnly", "-Prefer", "en")
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("-CleanOnly")
                 Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
 
                 $txt = Join-Path $dir "texts\Entities [entities].en.txt"
@@ -343,7 +463,7 @@ $tests = @(
                     "Keep this source"
                 )
 
-                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("-CleanOnly", "-Prefer", "en")
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("-CleanOnly")
                 Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
                 Assert-True (Test-Path -LiteralPath $subtitle) "Expected CleanOnly to preserve its subtitle source."
 
@@ -374,7 +494,7 @@ $tests = @(
                     (Utf8 @(208,148,208,176,208,187,209,140,209,136,208,181,32,208,179,208,190,208,178,208,190,209,128,208,184,208,188,32,208,191,209,128,208,190,32,208,173,208,180,208,178,209,131,208,180,32,208,184,32,208,154,208,176,209,128,208,178,208,176,209,143,46))
                 )
 
-                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("-CleanOnly", "-CleanTranscript", "-Prefer", "ru")
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("-CleanOnly", "-CleanTranscript")
                 Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
 
                 $clean = Join-Path $dir "texts\Transcript [transcript].ru-orig.clean.txt"
@@ -425,7 +545,7 @@ $tests = @(
                 (Get-Item -LiteralPath $first).LastWriteTimeUtc = [datetime]::UtcNow.AddMinutes(-2)
                 (Get-Item -LiteralPath $second).LastWriteTimeUtc = [datetime]::UtcNow.AddMinutes(-1)
 
-                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("https://example.test/fresh", "-Prefer", "en")
+                $result = Invoke-DownloadSubs -Directory $dir -Arguments @("https://example.test/fresh")
                 Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
                 Assert-True (Test-Path -LiteralPath $first) "Expected first unrelated subtitle to remain present."
                 Assert-True (Test-Path -LiteralPath $second) "Expected second unrelated subtitle to remain present."
@@ -452,7 +572,7 @@ $tests = @(
                 $result = Invoke-DownloadSubs `
                     -Directory $dir `
                     -WorkingDirectory $workingDir `
-                    -Arguments @("https://example.test/fresh", "-Prefer", "en", "-OutputDir", $outputDir)
+                    -Arguments @("https://example.test/fresh", "-OutputDir", $outputDir)
 
                 Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
                 $txt = Join-Path $outputDir "Fresh [fresh].en.txt"
@@ -466,7 +586,7 @@ $tests = @(
         }
     },
     @{
-        Name = "NoClean honors Srt and Langs while preserving subtitle collisions"
+        Name = "NoClean honors Srt while preserving original-track subtitle collisions"
         Run = {
             $dir = New-TestWorkspace
             $outputDir = Join-Path $dir "custom-output"
@@ -486,13 +606,10 @@ $tests = @(
                         "https://example.test/option-run",
                         "-NoClean",
                         "-Srt",
-                        "-Langs", "custom-lang",
                         "-OutputDir", $outputDir
                     )
 
                 Assert-True ($result.ExitCode -eq 0) "Expected NoClean success, got: $($result.Output)"
-                Assert-True ($result.Output -match "Trying subtitles: custom-lang") "Expected exact Langs override, got: $($result.Output)"
-                Assert-True ($result.Output -notmatch "Trying subtitles: (ru|en|de)") "Langs override unexpectedly fell back: $($result.Output)"
                 Assert-BytesEqual -Expected $oldBaseBytes -Actual ([System.IO.File]::ReadAllBytes($oldBase)) -Message "Existing base SRT changed."
                 Assert-BytesEqual -Expected $oldSecondBytes -Actual ([System.IO.File]::ReadAllBytes($oldSecond)) -Message "Existing -2 SRT changed."
 
@@ -524,7 +641,6 @@ $tests = @(
                     -Directory $dir `
                     -Arguments @(
                         "https://example.test/fresh",
-                        "-Prefer", "en",
                         "-KeepSubs",
                         "-OutputDir", $outputDir
                     )
@@ -571,7 +687,7 @@ $tests = @(
                     'try { [void]$gate.WaitOne() } finally { $gate.Dispose() }',
                     '$env:PATH = $directory + [System.IO.Path]::PathSeparator + $env:PATH',
                     'Set-Location -LiteralPath $directory',
-                    '& (Join-Path $directory "download-subs.ps1") $url -Prefer en -KeepSubs -OutputDir $outputDir',
+                    '& (Join-Path $directory "download-subs.ps1") $url -KeepSubs -OutputDir $outputDir',
                     'exit $LASTEXITCODE'
                 )
                 $gateName = "Local\TranscriptAtomicCli-" + [Guid]::NewGuid().ToString("N")
@@ -655,11 +771,11 @@ $tests = @(
             try {
                 $result = Invoke-DownloadSubs `
                     -Directory $dir `
-                    -Arguments @("https://example.test/all-attempts-fail", "-Prefer", "en")
+                    -Arguments @("https://example.test/all-attempts-fail")
 
                 Assert-True ($result.ExitCode -eq 1) "Expected normal-mode no-subtitle exit 1, got $($result.ExitCode): $($result.Output)"
                 Assert-True ($result.Output -match "synthetic all-attempt diagnostic") "Expected preserved failure diagnostic, got: $($result.Output)"
-                Assert-True ($result.Output -match "No Russian, English, or German subtitles") "Expected existing no-subtitle guidance, got: $($result.Output)"
+                Assert-True ($result.Output -match "No verified original subtitle track") "Expected original-track guidance, got: $($result.Output)"
             }
             finally {
                 Remove-Item -LiteralPath $dir -Recurse -Force
@@ -673,7 +789,7 @@ $tests = @(
             try {
                 $result = Invoke-DownloadSubs `
                     -Directory $dir `
-                    -Arguments @("https://example.test/downloaded-despite-error", "-Prefer", "en")
+                    -Arguments @("https://example.test/downloaded-despite-error")
 
                 Assert-True ($result.ExitCode -eq 0) "Expected downloaded subtitle to be converted, got: $($result.Output)"
                 Assert-True ($result.Output -match "yt-dlp reported an error") "Expected downloaded-despite-error warning, got: $($result.Output)"
@@ -686,18 +802,13 @@ $tests = @(
         }
     },
     @{
-        Name = "Unknown video language tries exact Russian tags before English"
+        Name = "Original-only mode does not fall back after the selected track is absent"
         Run = {
             $dir = New-TestWorkspace
             try {
                 $result = Invoke-DownloadSubs -Directory $dir -Arguments @("https://example.test/unknown-language")
-                Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
-
-                $ruIndex = $result.Output.IndexOf("Trying subtitles: ru-orig")
-                $enIndex = $result.Output.IndexOf("Trying subtitles: en-orig")
-                Assert-True ($ruIndex -ge 0) "Expected Russian attempt in output: $($result.Output)"
-                Assert-True ($enIndex -lt 0 -or $ruIndex -lt $enIndex) "Expected Russian before English, got: $($result.Output)"
-                Assert-True ($result.Output -notmatch "Trying subtitles: ru\.\*") "Expected exact Russian tags instead of wildcard, got: $($result.Output)"
+                Assert-True ($result.ExitCode -eq 1) "Missing selected track unexpectedly fell back: $($result.Output)"
+                Assert-True ($result.Output -match "No verified original subtitle track") "Expected original-only failure guidance, got: $($result.Output)"
             }
             finally {
                 Remove-Item -LiteralPath $dir -Recurse -Force
@@ -705,14 +816,12 @@ $tests = @(
         }
     },
     @{
-        Name = "Auto mode downloads German subtitles for German videos"
+        Name = "Original-only mode downloads the confirmed German manual track"
         Run = {
             $dir = New-TestWorkspace
             try {
                 $result = Invoke-DownloadSubs -Directory $dir -Arguments @("https://example.test/german-video")
                 Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
-                Assert-True ($result.Output -match "Trying subtitles: de-orig") "Expected German attempt, got: $($result.Output)"
-
                 $txt = Join-Path $dir "texts\German [german-video].de.txt"
                 Assert-True (Test-Path -LiteralPath $txt) "Expected German subtitle text to be created."
             }
@@ -722,16 +831,13 @@ $tests = @(
         }
     },
     @{
-        Name = "Prefer de downloads German subtitles explicitly"
+        Name = "Legacy explicit German preference is rejected"
         Run = {
             $dir = New-TestWorkspace
             try {
                 $result = Invoke-DownloadSubs -Directory $dir -Arguments @("https://example.test/prefer-german", "-Prefer", "de")
-                Assert-True ($result.ExitCode -eq 0) "Expected success, got: $($result.Output)"
-                Assert-True ($result.Output -match "Trying subtitles: de-orig") "Expected German attempt, got: $($result.Output)"
-
-                $txt = Join-Path $dir "texts\Prefer German [prefer-german].de.txt"
-                Assert-True (Test-Path -LiteralPath $txt) "Expected German subtitle text to be created."
+                Assert-True ($result.ExitCode -ne 0) "Legacy language preference unexpectedly succeeded."
+                Assert-True ($result.Output -match "no longer supported") "Expected migration guidance, got: $($result.Output)"
             }
             finally {
                 Remove-Item -LiteralPath $dir -Recurse -Force

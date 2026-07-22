@@ -2,7 +2,7 @@
 
 Small Windows utility with desktop and command-line modes for saving readable text transcripts from YouTube videos.
 
-The bundled `yt-dlp.exe` next to the scripts is used first. The desktop app can also fall back to `yt-dlp.exe` from `PATH`. The tool does not download video files and does not require a YouTube API key or login.
+The supported bundled `yt-dlp.exe` next to the scripts is always used. The tool does not use a different executable from `PATH`, download video files, or require a YouTube API key or login.
 
 ## What It Does
 
@@ -13,14 +13,15 @@ The bundled `yt-dlp.exe` next to the scripts is used first. The desktop app can 
 - Remains usable while `yt-dlp` is running in the background.
 - Continues later queue items when one video fails and allows the failed item to be retried.
 - Cancels the active background worker and its `yt-dlp` child process when the desktop window is closed.
-- Remembers the root save folder and shared subtitle language between launches.
+- Remembers the root save folder between launches.
+- Selects only the video's original subtitle language and never intentionally downloads a YouTube machine translation.
 - Copies a completed transcript, or the root folder path, to the clipboard.
 
 ## Requirements
 
 - Windows.
 - Windows PowerShell 5 or newer, included with Windows.
-- The bundled `yt-dlp.exe` next to the scripts. The desktop app can alternatively use one installed in `PATH`.
+- The bundled stable `yt-dlp.exe` version `2026.07.04` or newer next to the scripts.
 - Internet access.
 
 Python is not required.
@@ -67,14 +68,14 @@ Pass a YouTube URL to the console launcher:
 Examples:
 
 ```powershell
-# Prefer English and choose an output folder.
-.\download-subs.cmd "https://www.youtube.com/watch?v=VIDEO_ID" -Prefer en -OutputDir "D:\Transcripts"
+# Choose an output folder. The original language is selected automatically.
+.\download-subs.cmd "https://www.youtube.com/watch?v=VIDEO_ID" -OutputDir "D:\Transcripts"
 
 # Show the video's available subtitle tracks without downloading them.
 .\download-subs.cmd -List "https://www.youtube.com/watch?v=VIDEO_ID"
 
-# Request explicit yt-dlp language expressions.
-.\download-subs.cmd "https://www.youtube.com/watch?v=VIDEO_ID" -Langs "ru.*,en.*"
+# Convert the newest local VTT/SRT file beside the scripts.
+.\download-subs.cmd -CleanOnly -OutputDir "D:\Transcripts"
 ```
 
 The default command downloads subtitles into an isolated temporary folder, converts the selected current-run subtitle to text, and then removes only that temporary folder.
@@ -83,7 +84,24 @@ The default command downloads subtitles into an isolated temporary folder, conve
 - `-NoClean` skips text conversion and copies all subtitle files produced by the current run into the output folder. It does not expose or reuse the temporary working folder.
 - `-Srt` requests SRT instead of VTT.
 - `-CleanTranscript` enables the optional transcript-specific text normalization.
-- `-CleanOnly` converts an existing VTT or SRT file beside the scripts without deleting that source file.
+- `-CleanOnly` converts the newest existing VTT or SRT file beside the scripts without deleting that source file. Equal timestamps are resolved deterministically by full path.
+
+The former online language overrides `-Prefer` and `-Langs` are no longer supported. Supplying either one exits with migration guidance instead of silently changing or ignoring the requested language.
+
+`-List` performs the same isolated metadata check as a download and classifies tracks as `Manual`, `AutomaticOriginal`, `AutomaticUntrusted`, or `ExcludedService`; it does not download subtitles.
+
+## Original Subtitle Selection
+
+The desktop and command-line modes use the same deterministic selector:
+
+1. Determine the video's original spoken language from YouTube original-caption and audio metadata.
+2. Prefer a matching creator-provided/manual track.
+3. If no matching manual track exists, allow only an original automatic track whose raw tag ends in `-orig`.
+4. Never use other automatic-caption tags as a translation fallback.
+
+When the original language cannot be independently established, one sole manual track may still be saved with a warning. Multiple plausible tracks are reported as ambiguous instead of guessed. A failed or rate-limited selected track is not retried in another language.
+
+Original automatic speech recognition is a successful result but always displays a persistent warning: names, numbers, addresses, and other details may be wrong. Verify important details against the video.
 
 ## File Safety
 
@@ -107,12 +125,12 @@ YouTube Transcript Tool
 ## How To Use
 
 1. Open the desktop shortcut.
-2. Choose the root save folder and one shared subtitle language.
+2. Choose the root save folder. Subtitle language is determined from the video.
 3. Paste a YouTube link into the first video card.
 4. Optionally select a project. `Без проекта` saves directly in the root folder.
 5. Use `Создать проект…` to create a project folder under the selected root.
 6. Use `+ Добавить видео` to add up to six cards. Empty cards are ignored.
-7. Click `Сохранить видео`. Filled cards are processed from top to bottom.
+7. Click `Сохранить текст`. Filled cards are processed from top to bottom.
 8. If one video fails, later cards continue. Correct the failed card and click `Повторить`.
 9. Right-click a completed card to open its transcript-file menu.
 10. Choose `Скопировать путь`, `Скопировать содержимое файла`, or `Показать в проводнике`.
@@ -147,10 +165,9 @@ Settings are stored here:
 
 The desktop app uses:
 
-- output folder;
-- selected language.
+- output folder.
 
-Older settings files can retain a compatibility `KeepSubtitles` field, but the desktop app ignores it and writes it as `false`.
+Older settings files may retain `Language`; the desktop app ignores it and omits it when settings are next written. A compatibility `KeepSubtitles` field remains supported internally.
 
 ## Errors
 
@@ -158,25 +175,26 @@ Each affected video card shows a message for:
 
 - invalid YouTube link;
 - unavailable/private video;
-- no subtitles;
-- selected language unavailable;
+- no eligible subtitle tracks;
+- no verified original track;
+- ambiguous or conflicting original-language evidence;
+- an unsupported `yt-dlp` version or metadata contract;
 - missing `yt-dlp.exe`;
 - network/rate-limit problems;
 - no write access to the selected folder;
 - file write errors.
 
-If the selected language is unavailable, the error includes the available subtitle language tags.
 An error in one card does not stop the remaining queue.
 
 ## YouTube Subtitle Limitations
 
-YouTube subtitles are often imperfect. Auto-generated captions can contain recognition mistakes, broken names, and bad punctuation. Auto-translated subtitles are usually worse than original-language captions.
+YouTube subtitles are often imperfect. Creator-provided captions are preferred, but they can still contain mistakes. Auto-generated original captions can contain recognition errors in names, numbers, addresses, terminology, and punctuation. The tool excludes YouTube auto-translations from selection.
 
 For publishing-quality text, use original-language subtitles as a draft and edit the result manually.
 
 ## Update yt-dlp
 
-Updates are manual; the app does not update in the background and does not provide an update button. From PowerShell in the tool folder, install the current stable release and then check the bundled version:
+Updates are manual; the app does not update in the background and does not provide an update button. Version `2026.07.04` is the minimum supported contract. From PowerShell in the tool folder, install a current stable release and then check the bundled version:
 
 ```powershell
 .\yt-dlp.exe -U
@@ -190,11 +208,12 @@ Updates are manual; the app does not update in the background and does not provi
 3. Add six cards, then remove and re-add one card.
 4. Confirm the inline clear button removes only its URL.
 5. Fill at least two cards, leave one card empty, and assign different projects.
-6. Choose a shared language and click `Сохранить видео`.
+6. Click `Сохранить текст`; confirm there is no language selector.
 7. Confirm filled cards run top-to-bottom and the empty card is ignored.
 8. Confirm every successful card creates one `.txt` in the expected folder.
 9. Right-click a successful card and confirm all three file actions work: copy path, copy file contents, and show the exact file in Explorer.
 10. Include one failing link and confirm later cards continue and `Повторить` appears.
+11. Include an original automatic-caption fixture and confirm its accuracy warning remains visible on the completed card.
 
 ## Developer Checks
 

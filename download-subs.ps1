@@ -9,8 +9,7 @@ param(
     [switch]$Srt,
     [switch]$CleanTranscript,
 
-    [ValidateSet("auto", "ru", "en", "de")]
-    [string]$Prefer = "auto",
+    [string]$Prefer,
 
     [string]$OutputDir = "texts",
 
@@ -28,42 +27,16 @@ if (-not (Test-Path -LiteralPath $tool)) {
 
 Import-Module $modulePath -Force
 
+if ($PSBoundParameters.ContainsKey("Prefer") -or $PSBoundParameters.ContainsKey("Langs")) {
+    throw "-Prefer and -Langs are no longer supported. Online downloads always use the video's original language."
+}
+
 function Get-OutputDirectory {
     if ([System.IO.Path]::IsPathRooted($OutputDir)) {
         return $OutputDir
     }
 
     return (Join-Path $PSScriptRoot $OutputDir)
-}
-
-function Get-CleanOnlySubtitlePriority {
-    param(
-        [Parameter(Mandatory = $true)]
-        [System.IO.FileInfo]$File
-    )
-
-    $name = $File.Name.ToLowerInvariant()
-    $priority = if ($Prefer -eq "en") {
-        @("en-orig", "en", "ru", "ru-orig", "de-orig", "de")
-    }
-    elseif ($Prefer -eq "ru") {
-        @("ru-orig", "ru", "en", "en-orig", "de-orig", "de")
-    }
-    elseif ($Prefer -eq "de") {
-        @("de-orig", "de", "en", "en-orig", "ru", "ru-orig")
-    }
-    else {
-        @("ru-orig", "ru", "en-orig", "en", "de-orig", "de")
-    }
-
-    for ($i = 0; $i -lt $priority.Count; $i++) {
-        $tag = [regex]::Escape($priority[$i])
-        if ($name -match "\.$tag\.(vtt|srt)$") {
-            return $i
-        }
-    }
-
-    return 9
 }
 
 function Select-CleanOnlySubtitleFile {
@@ -74,8 +47,8 @@ function Select-CleanOnlySubtitleFile {
 
     return $Subtitles |
         Sort-Object `
-            @{ Expression = { Get-CleanOnlySubtitlePriority -File $_ }; Ascending = $true },
-            @{ Expression = { $_.LastWriteTimeUtc }; Descending = $true } |
+            @{ Expression = { $_.LastWriteTimeUtc }; Descending = $true },
+            @{ Expression = { $_.FullName }; Ascending = $true } |
         Select-Object -First 1
 }
 
@@ -84,16 +57,12 @@ if ($List) {
         throw "Usage: .\download-subs.ps1 -List VIDEO_URL"
     }
 
-    $listResult = Invoke-TranscriptProcess -FilePath $tool -ArgumentList @("--skip-download", "--list-subs", $Url)
-    if ($listResult.StdOut) {
-        [Console]::Out.Write($listResult.StdOut)
+    $managedTool = Get-YtDlpPath -PreferredPath $tool
+    $info = Invoke-YtDlpJson -YtDlpPath $managedTool -Url $Url
+    foreach ($track in @(Get-TranscriptSubtitleInventory -Info $info)) {
+        [Console]::Out.WriteLine(("{0}`t{1}" -f @($track.RawTrackTag, $track.SourceKind)))
     }
-
-    if ($listResult.StdErr) {
-        [Console]::Error.Write($listResult.StdErr)
-    }
-
-    exit $listResult.ExitCode
+    exit 0
 }
 
 if ($CleanOnly) {
@@ -129,17 +98,11 @@ if (-not $Url) {
 $saved = Save-TranscriptFromYoutubeCli `
     -Url $Url `
     -OutputDir (Get-OutputDirectory) `
-    -Preference $Prefer `
-    -SubtitleLanguages $Langs `
     -NoClean ([bool]$NoClean) `
     -KeepSubtitles ([bool]$KeepSubs) `
     -Srt ([bool]$Srt) `
     -CleanTranscript ([bool]$CleanTranscript) `
-    -YtDlpPath $tool `
-    -OnAttempt {
-        param($subtitleLanguages)
-        Write-Host "Trying subtitles: $subtitleLanguages"
-    }
+    -YtDlpPath $tool
 
 $diagnostic = if ($saved.Output) { [string]$saved.Output } else { [string]$saved.StdErr }
 
@@ -161,12 +124,23 @@ if ($saved.FoundSubtitles -and $saved.YtDlpExitCode -ne 0) {
     Write-Warning $warning
 }
 
+if ($saved.FoundSubtitles) {
+    switch ([string]$saved.WarningCode) {
+        "AutomaticOriginalAccuracy" {
+            Write-Warning "Автоматически распознанные субтитры. Имена, числа, адреса и другие детали могут содержать ошибки распознавания."
+        }
+        "ManualLanguageUnconfirmed" {
+            Write-Warning "Язык не удалось независимо подтвердить. Сохранён единственный доступный авторский трек."
+        }
+    }
+}
+
 if ($NoClean) {
     exit $saved.ExitCode
 }
 
 if (-not $saved.FoundSubtitles) {
-    Write-Host "No Russian, English, or German subtitles were found for this video."
+    Write-Host "No verified original subtitle track was downloaded for this video."
     Write-Host "Check all available subtitle languages with:"
     Write-Host ".\download-subs.cmd -List `"$Url`""
     exit 1

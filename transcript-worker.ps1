@@ -6,9 +6,6 @@ param(
     [string]$OutputDir,
 
     [Parameter(Mandatory = $true)]
-    [string]$Language,
-
-    [Parameter(Mandatory = $true)]
     [ValidateSet("0", "1")]
     [string]$KeepSubtitles,
 
@@ -49,7 +46,6 @@ try {
     Save-TranscriptFromYoutube `
         -Url $Url `
         -OutputDir $OutputDir `
-        -Language $Language `
         -KeepSubtitles:($KeepSubtitles -eq "1") `
         -OperationId $OperationId `
         -OnStatus {
