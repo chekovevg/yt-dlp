@@ -40,6 +40,15 @@ public class Program {
 
     public static int Main(string[] args) {
         var url = args.Length == 0 ? "" : args[args.Length - 1];
+        var isolated = args.Length >= 2 && args[0] == "--ignore-config" && args[1] == "--no-plugin-dirs";
+        if (args.Contains("--version")) {
+            if (!isolated) {
+                Console.Error.WriteLine("managed isolation prefix missing");
+                return 12;
+            }
+            Console.WriteLine("2026.07.04");
+            return 0;
+        }
         if (args.Contains("--hang-child")) {
             Thread.Sleep(Timeout.Infinite);
             return 0;
@@ -72,7 +81,7 @@ public class Program {
         if (url.Contains("metadata-hang-always")) {
             return HangWithChild(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "metadata-hang-always-pids.txt"));
         }
-        if (url.Contains("cli-failure")) {
+        if (url.Contains("cli-failure") && !args.Contains("--dump-single-json")) {
             Console.Error.WriteLine("ERROR: " + new string('x', 3000) + " TAIL-CLI-DIAGNOSTIC");
             return 7;
         }
@@ -81,19 +90,40 @@ public class Program {
             return 1;
         }
         if (args.Contains("--dump-single-json")) {
+            if (!isolated) {
+                Console.Error.WriteLine("managed isolation prefix missing");
+                return 12;
+            }
             Console.Error.WriteLine("WARNING: harmless warning");
-            Console.WriteLine("{\"id\":\"abc123\",\"title\":\"Test\",\"subtitles\":{},\"automatic_captions\":{\"ru\":[{\"ext\":\"vtt\"}]}}");
+            if (url.Contains("manual-original")) {
+                Console.WriteLine("{\"id\":\"abc123\",\"title\":\"Test\",\"subtitles\":{\"en\":[{\"ext\":\"vtt\",\"url\":\"https://www.youtube.com/api/timedtext?manual=1\",\"protocol\":\"https\"}]},\"automatic_captions\":{\"en-orig\":[{\"ext\":\"vtt\",\"url\":\"https://www.youtube.com/api/timedtext?auto=1\",\"protocol\":\"https\"}],\"ru\":[{\"ext\":\"vtt\",\"url\":\"https://www.youtube.com/api/timedtext?translated=1\",\"protocol\":\"https\"}]},\"formats\":[{\"acodec\":\"opus\",\"language\":\"en\",\"language_preference\":10}]}");
+            }
+            else {
+                Console.WriteLine("{\"id\":\"abc123\",\"title\":\"Test\",\"subtitles\":{},\"automatic_captions\":{\"en-US-orig\":[{\"ext\":\"vtt\",\"url\":\"https://www.youtube.com/api/timedtext?fixture=1\",\"protocol\":\"https\"}],\"ru\":[{\"ext\":\"vtt\",\"url\":\"https://www.youtube.com/api/timedtext?translated=1\",\"protocol\":\"https\"}]},\"formats\":[{\"acodec\":\"opus\",\"language\":\"en-US\",\"language_preference\":10}]}");
+            }
             return 0;
         }
+        File.AppendAllLines(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "download-invocations.txt"), new[] { url });
+        File.WriteAllLines(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "last-download-args.txt"), args);
         if (url.Contains("download-long")) {
             Console.Error.WriteLine("ERROR: " + new string('d', 3000) + " TAIL-DOWNLOAD-DIAGNOSTIC");
             return 6;
+        }
+        if (url.Contains("download-rate-limit")) {
+            Console.Error.WriteLine("ERROR: HTTP Error 429: Too Many Requests");
+            return 9;
+        }
+        if (!isolated) {
+            Console.Error.WriteLine("managed isolation prefix missing");
+            return 12;
         }
         var outputIndex = Array.IndexOf(args, "-o");
         var template = args[outputIndex + 1];
         var directory = Path.GetDirectoryName(template);
         Directory.CreateDirectory(directory);
-        File.WriteAllText(Path.Combine(directory, "abc123.ru.vtt"), "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nWorking transcript\n", new UTF8Encoding(false));
+        var languageIndex = Array.IndexOf(args, "--sub-langs");
+        var language = languageIndex >= 0 ? args[languageIndex + 1] : "missing";
+        File.WriteAllText(Path.Combine(directory, "abc123." + language + ".vtt"), "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nWorking transcript\n", new UTF8Encoding(false));
         Console.Error.WriteLine("WARNING: harmless warning");
         return 0;
     }
@@ -177,136 +207,451 @@ function Assert-StringSetsEqual {
     Assert-True (($expectedValues -join "|") -eq ($actualValues -join "|")) "$Message Expected '$($expectedValues -join ", ")', got '$($actualValues -join ", ")'."
 }
 
-function New-FakeInfo {
-    $subtitles = [pscustomobject]@{
-        en = @([pscustomobject]@{ ext = "vtt" })
-    }
+function New-DirectSubtitleFormat {
+    param(
+        [string]$Extension = "vtt",
+        [string]$Url = "https://www.youtube.com/api/timedtext?fixture=1"
+    )
 
-    $automaticCaptions = [pscustomobject]@{
-        ru = @([pscustomobject]@{ ext = "vtt" })
-        "en-GB" = @([pscustomobject]@{ ext = "vtt" })
+    return [pscustomobject]@{
+        ext = $Extension
+        url = $Url
+        protocol = "https"
     }
+}
 
-    [pscustomobject]@{
+function New-OriginalSubtitleInfo {
+    param(
+        [AllowNull()]
+        [object]$Subtitles = ([pscustomobject]@{}),
+
+        [AllowNull()]
+        [object]$AutomaticCaptions = ([pscustomobject]@{}),
+
+        [AllowEmptyCollection()]
+        [object[]]$Formats = @()
+    )
+
+    return [pscustomobject]@{
         id = "abc123"
-        title = "Unsafe / Video: Title?"
-        subtitles = $subtitles
-        automatic_captions = $automaticCaptions
+        title = "Original subtitle fixture"
+        subtitles = $Subtitles
+        automatic_captions = $AutomaticCaptions
+        formats = @($Formats)
     }
 }
 
 $tests = @(
     @{
-        Name = "Auto chooses ru auto captions before manual en and de"
+        Name = "Original settings migration ignores legacy language and omits it on write"
         Run = {
-            $choice = Resolve-TranscriptSubtitleChoice -Info (New-FakeInfo) -Preference "auto"
-            Assert-True ($choice.Language -eq "ru") "Expected ru, got $($choice.Language)"
-            Assert-True ($choice.Source -eq "auto") "Expected auto captions, got $($choice.Source)"
-        }
-    },
-    @{
-        Name = "Auto chooses Russian captions when only automatic captions exist"
-        Run = {
-            $autoOnly = [pscustomobject]@{
-                subtitles = $null
-                automatic_captions = [pscustomobject]@{
-                    ru = @([pscustomobject]@{ ext = "vtt" })
-                }
-            }
-
-            $choice = Resolve-TranscriptSubtitleChoice -Info $autoOnly -Preference "auto"
-            Assert-True ($choice.Tag -eq "ru") "Expected auto-only Russian captions."
-        }
-    },
-    @{
-        Name = "Auto chooses English captions when only manual captions exist"
-        Run = {
-            $manualOnly = [pscustomobject]@{
-                subtitles = [pscustomobject]@{
-                    en = @([pscustomobject]@{ ext = "vtt" })
-                }
-                automatic_captions = $null
-            }
-
-            $choice = Resolve-TranscriptSubtitleChoice -Info $manualOnly -Preference "auto"
-            Assert-True ($choice.Tag -eq "en") "Expected manual-only English captions."
-        }
-    },
-    @{
-        Name = "Explicit English preference accepts an Australian regional tag"
-        Run = {
-            $regionalEnglish = [pscustomobject]@{
-                subtitles = [pscustomobject]@{
-                    "en-AU" = @([pscustomobject]@{ ext = "vtt" })
-                }
-                automatic_captions = [pscustomobject]@{
-                    ja = @([pscustomobject]@{ ext = "vtt" })
-                }
-            }
-
-            $choice = Resolve-TranscriptSubtitleChoice -Info $regionalEnglish -Preference "en"
-            Assert-True ($choice.Tag -eq "en-AU") "Expected en-AU for an explicit English preference."
-        }
-    },
-    @{
-        Name = "Auto skips manual live chat in favor of Japanese captions"
-        Run = {
-            $liveChatAndCaptions = [pscustomobject]@{
-                subtitles = [pscustomobject]@{
-                    live_chat = @([pscustomobject]@{ ext = "vtt" })
-                }
-                automatic_captions = [pscustomobject]@{
-                    ja = @([pscustomobject]@{ ext = "vtt" })
-                }
-            }
-
-            $choice = Resolve-TranscriptSubtitleChoice -Info $liveChatAndCaptions -Preference "auto"
-            Assert-True ($choice.Tag -eq "ja") "Expected Japanese captions instead of live chat."
-        }
-    },
-    @{
-        Name = "Auto skips unusable manual formats in favor of Japanese captions"
-        Run = {
-            $unusableManualAndCaptions = [pscustomobject]@{
-                subtitles = [pscustomobject]@{
-                    fr = @([pscustomobject]@{ ext = "json" })
-                }
-                automatic_captions = [pscustomobject]@{
-                    ja = @([pscustomobject]@{ ext = "vtt" })
-                }
-            }
-
-            $choice = Resolve-TranscriptSubtitleChoice -Info $unusableManualAndCaptions -Preference "auto"
-            Assert-True ($choice.Tag -eq "ja") "Expected Japanese captions instead of an unusable manual format."
-        }
-    },
-    @{
-        Name = "Auto skips a manual language whose format list is empty"
-        Run = {
-            $emptyManualAndCaptions = [pscustomobject]@{
-                subtitles = [pscustomobject]@{
-                    fr = @()
-                }
-                automatic_captions = [pscustomobject]@{
-                    ja = @([pscustomobject]@{ ext = "VTT" })
-                }
-            }
-
-            $choice = Resolve-TranscriptSubtitleChoice -Info $emptyManualAndCaptions -Preference "auto"
-            Assert-True ($choice.Tag -eq "ja") "Expected Japanese VTT captions instead of empty French formats, got $($choice.Tag)."
-        }
-    },
-    @{
-        Name = "Selected unavailable supported language returns available language list"
-        Run = {
+            $oldAppData = $env:APPDATA
+            $settingsRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-settings-original-only-" + [Guid]::NewGuid().ToString("N"))
+            $env:APPDATA = $settingsRoot
             try {
-                Resolve-TranscriptSubtitleChoice -Info (New-FakeInfo) -Preference "de" | Out-Null
-                throw "Expected language error."
+                $settingsDir = Join-Path $settingsRoot "YouTubeTranscriptTool"
+                New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
+                [pscustomobject]@{
+                    OutputDir = "D:\Transcripts"
+                    Language = "ru"
+                    KeepSubtitles = $true
+                } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $settingsDir "settings.json") -Encoding utf8
+
+                $loaded = Read-TranscriptSettings
+                Assert-PropertyNames -Value $loaded -Expected @("OutputDir", "KeepSubtitles") -Message "Migrated settings still expose language."
+                Assert-True ($loaded.OutputDir -eq "D:\Transcripts") "Legacy output directory was not preserved."
+                Assert-True ([bool]$loaded.KeepSubtitles) "Legacy subtitle-retention setting was not preserved."
+
+                Write-TranscriptSettings -OutputDir "D:\New Transcripts" -KeepSubtitles:$false
+                $written = Get-Content -LiteralPath (Join-Path $settingsDir "settings.json") -Raw -Encoding utf8 | ConvertFrom-Json
+                Assert-PropertyNames -Value $written -Expected @("OutputDir", "KeepSubtitles") -Message "New settings still persist language."
+            }
+            finally {
+                $env:APPDATA = $oldAppData
+                Remove-Item -LiteralPath $settingsRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
+        Name = "Original download core requests one exact automatic original track"
+        Run = {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-original-download-" + [Guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            try {
+                $result = Save-TranscriptFromYoutube `
+                    -Url "https://youtube.com/watch?v=automatic-original" `
+                    -OutputDir $dir `
+                    -KeepSubtitles $false `
+                    -YtDlpPath $fakeYtDlpPath
+                $arguments = @(Get-Content -LiteralPath (Join-Path $fakeRoot "last-download-args.txt"))
+
+                Assert-True (($arguments[0..1] -join "|") -eq "--ignore-config|--no-plugin-dirs") "Download was not isolated."
+                Assert-True (@($arguments | Where-Object { $_ -eq "--write-auto-subs" }).Count -eq 1) "Expected exactly one automatic source flag."
+                Assert-True (@($arguments | Where-Object { $_ -eq "--write-subs" }).Count -eq 0) "Manual and automatic source flags must not be combined."
+                Assert-True (@($arguments | Where-Object { $_ -eq "--sub-langs" }).Count -eq 1) "Expected one exact subtitle selector."
+                $languageIndex = [Array]::IndexOf($arguments, "--sub-langs")
+                Assert-True ($arguments[$languageIndex + 1] -ceq "en-US-orig") "Expected the literal raw original tag."
+                $formatIndex = [Array]::IndexOf($arguments, "--sub-format")
+                Assert-True ($arguments[$formatIndex + 1] -eq "vtt/srt") "Expected bounded VTT/SRT formats only."
+                $extractorIndex = [Array]::IndexOf($arguments, "--extractor-args")
+                Assert-True ($arguments[$extractorIndex + 1] -eq "youtube:skip=translated_subs") "Expected translated subtitle expansion to be disabled."
+                Assert-True ($result.CanonicalLanguageTag -eq "en-US") "Expected canonical result language."
+                Assert-True ($result.WarningCode -eq "AutomaticOriginalAccuracy") "Expected ASR warning result."
+                Assert-True ($result.TextPath -match '_en-US\.txt$') "Expected canonical language in output filename: $($result.TextPath)"
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
+        Name = "Original download core prefers matching manual track"
+        Run = {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-manual-download-" + [Guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            try {
+                $result = Save-TranscriptFromYoutube `
+                    -Url "https://youtube.com/watch?v=manual-original" `
+                    -OutputDir $dir `
+                    -KeepSubtitles $false `
+                    -YtDlpPath $fakeYtDlpPath
+                $arguments = @(Get-Content -LiteralPath (Join-Path $fakeRoot "last-download-args.txt"))
+
+                Assert-True (@($arguments | Where-Object { $_ -eq "--write-subs" }).Count -eq 1) "Expected exactly one manual source flag."
+                Assert-True (@($arguments | Where-Object { $_ -eq "--write-auto-subs" }).Count -eq 0) "Automatic source flag must not accompany a manual choice."
+                $languageIndex = [Array]::IndexOf($arguments, "--sub-langs")
+                Assert-True ($arguments[$languageIndex + 1] -ceq "en") "Expected the exact manual English tag."
+                Assert-True ($result.SourceKind -eq "Manual") "Expected manual result source."
+                Assert-True ([string]::IsNullOrEmpty([string]$result.WarningCode)) "Confirmed manual result should not warn."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
+        Name = "Original download CLI shares the exact original selector"
+        Run = {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-cli-original-download-" + [Guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            try {
+                $result = Save-TranscriptFromYoutubeCli `
+                    -Url "https://youtube.com/watch?v=automatic-original" `
+                    -OutputDir $dir `
+                    -NoClean $false `
+                    -KeepSubtitles $false `
+                    -Srt $false `
+                    -CleanTranscript $false `
+                    -YtDlpPath $fakeYtDlpPath
+                $arguments = @(Get-Content -LiteralPath (Join-Path $fakeRoot "last-download-args.txt"))
+                $languageIndex = [Array]::IndexOf($arguments, "--sub-langs")
+
+                Assert-True ($result.FoundSubtitles) "Expected CLI subtitles."
+                Assert-True ($arguments[$languageIndex + 1] -ceq "en-US-orig") "CLI did not use the shared raw selector."
+                Assert-True ($result.CanonicalLanguageTag -eq "en-US") "CLI did not return the shared canonical language."
+                Assert-True ($result.WarningCode -eq "AutomaticOriginalAccuracy") "CLI did not return the ASR warning code."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
+        Name = "Original download rate limit never retries another language"
+        Run = {
+            $invocationPath = Join-Path $fakeRoot "download-invocations.txt"
+            Remove-Item -LiteralPath $invocationPath -Force -ErrorAction SilentlyContinue
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-rate-limit-download-" + [Guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            try {
+                try {
+                    Save-TranscriptFromYoutube `
+                        -Url "https://youtube.com/watch?v=download-rate-limit" `
+                        -OutputDir $dir `
+                        -KeepSubtitles $false `
+                        -YtDlpPath $fakeYtDlpPath | Out-Null
+                    throw "Expected subtitle rate limiting."
+                }
+                catch {
+                    Assert-True ($_.Exception.Message -eq "YouTube temporarily rate-limited subtitle downloads. Wait a little and try again.") "Expected the existing rate-limit diagnostic, got: $($_.Exception.Message)"
+                }
+
+                $invocations = @(Get-Content -LiteralPath $invocationPath)
+                Assert-True ($invocations.Count -eq 1) "A selected-track failure triggered $($invocations.Count) download attempts."
+            }
+            finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
+        Name = "yt-dlp contract prepends managed isolation arguments"
+        Run = {
+            $module = Get-Module transcript-tool
+            $arguments = @(& $module {
+                Get-ManagedYtDlpArguments -ArgumentList @("--version")
+            })
+
+            Assert-True (($arguments -join "|") -eq "--ignore-config|--no-plugin-dirs|--version") "Managed arguments were not isolated: $($arguments -join ', ')"
+        }
+    },
+    @{
+        Name = "yt-dlp contract accepts the minimum stable version and rejects older versions"
+        Run = {
+            $module = Get-Module transcript-tool
+            & $module { Assert-YtDlpVersionText -Version "2026.07.04" }
+            & $module { Assert-YtDlpVersionText -Version "2026.12.31" }
+
+            foreach ($unsupported in @("2026.07.03", "nightly@2026.07.04", "not-a-version")) {
+                try {
+                    & $module { param($Version) Assert-YtDlpVersionText -Version $Version } $unsupported
+                    throw "Expected version '$unsupported' to be rejected."
+                }
+                catch {
+                    Assert-True ($_.Exception.Message -match "UnsupportedYtDlpContract") "Expected bounded version-contract failure for '$unsupported', got: $($_.Exception.Message)"
+                }
+            }
+        }
+    },
+    @{
+        Name = "yt-dlp contract validates subtitle maps and formats array"
+        Run = {
+            $module = Get-Module transcript-tool
+            $valid = New-OriginalSubtitleInfo -Subtitles ([pscustomobject]@{
+                en = @((New-DirectSubtitleFormat))
+            })
+            & $module { param($Info) Assert-YtDlpMetadataContract -Info $Info } $valid
+
+            $invalidFixtures = @(
+                [pscustomobject]@{ subtitles = [pscustomobject]@{}; automatic_captions = [pscustomobject]@{} },
+                [pscustomobject]@{ subtitles = @(); automatic_captions = [pscustomobject]@{}; formats = @() },
+                [pscustomobject]@{ subtitles = [pscustomobject]@{ en = [pscustomobject]@{ ext = "vtt" } }; automatic_captions = [pscustomobject]@{}; formats = @() }
+            )
+
+            foreach ($invalid in $invalidFixtures) {
+                try {
+                    & $module { param($Info) Assert-YtDlpMetadataContract -Info $Info } $invalid
+                    throw "Expected incompatible metadata to be rejected."
+                }
+                catch {
+                    Assert-True ($_.Exception.Message -match "UnsupportedYtDlpContract") "Expected bounded metadata-contract failure, got: $($_.Exception.Message)"
+                }
+            }
+        }
+    },
+    @{
+        Name = "yt-dlp contract metadata probe is isolated and validated"
+        Run = {
+            $info = Invoke-YtDlpJson -YtDlpPath $fakeYtDlpPath -Url "https://youtube.com/watch?v=contract"
+            Assert-True ($info.id -eq "abc123") "Expected validated metadata from the isolated probe."
+            Assert-True ($info.formats.Count -eq 1) "Expected the required formats array."
+        }
+    },
+    @{
+        Name = "Original resolver prefers matching manual captions over translated automatic captions"
+        Run = {
+            $info = New-OriginalSubtitleInfo `
+                -Subtitles ([pscustomobject]@{
+                    en = @((New-DirectSubtitleFormat))
+                }) `
+                -AutomaticCaptions ([pscustomobject]@{
+                    "en-orig" = @((New-DirectSubtitleFormat))
+                    ru = @((New-DirectSubtitleFormat))
+                }) `
+                -Formats @([pscustomobject]@{
+                    acodec = "opus"
+                    language = "en"
+                    language_preference = 10
+                })
+
+            $choice = Resolve-TranscriptSubtitleChoice -Info $info
+
+            Assert-True ($choice.RawTrackTag -eq "en") "Expected the manual English raw tag, got '$($choice.RawTrackTag)'."
+            Assert-True ($choice.CanonicalLanguageTag -eq "en") "Expected canonical English, got '$($choice.CanonicalLanguageTag)'."
+            Assert-True ($choice.BaseLanguage -eq "en") "Expected English base language, got '$($choice.BaseLanguage)'."
+            Assert-True ($choice.SourceKind -eq "Manual") "Expected manual captions, got '$($choice.SourceKind)'."
+            Assert-True ($choice.Confidence -eq "Confirmed") "Expected confirmed confidence, got '$($choice.Confidence)'."
+            Assert-True ([string]::IsNullOrEmpty([string]$choice.WarningCode)) "Confirmed manual captions should not warn."
+        }
+    },
+    @{
+        Name = "Original resolver accepts only dash-orig automatic captions"
+        Run = {
+            $info = New-OriginalSubtitleInfo `
+                -AutomaticCaptions ([pscustomobject]@{
+                    "en-US-orig" = @((New-DirectSubtitleFormat -Extension "srt"))
+                    en = @((New-DirectSubtitleFormat))
+                    ru = @((New-DirectSubtitleFormat))
+                })
+
+            $choice = Resolve-TranscriptSubtitleChoice -Info $info
+
+            Assert-True ($choice.RawTrackTag -eq "en-US-orig") "Expected the literal original ASR tag."
+            Assert-True ($choice.CanonicalLanguageTag -eq "en-US") "Expected terminal -orig to be removed only from the canonical tag."
+            Assert-True ($choice.BaseLanguage -eq "en") "Expected English base language."
+            Assert-True ($choice.SourceKind -eq "AutomaticOriginal") "Expected original ASR source."
+            Assert-True ($choice.WarningCode -eq "AutomaticOriginalAccuracy") "Expected the ASR accuracy warning code."
+            Assert-True ($choice.PreferredExtension -eq "srt") "Expected direct SRT when no direct VTT representation exists."
+        }
+    },
+    @{
+        Name = "Original resolver accepts one manual track without evidence with warning"
+        Run = {
+            $info = New-OriginalSubtitleInfo -Subtitles ([pscustomobject]@{
+                ja = @((New-DirectSubtitleFormat))
+            })
+
+            $choice = Resolve-TranscriptSubtitleChoice -Info $info
+
+            Assert-True ($choice.RawTrackTag -eq "ja") "Expected the sole manual track."
+            Assert-True ($choice.SourceKind -eq "Manual") "Expected a manual source."
+            Assert-True ($choice.Confidence -eq "Presumed") "Expected presumed confidence."
+            Assert-True ($choice.WarningCode -eq "ManualLanguageUnconfirmed") "Expected the unconfirmed-language warning."
+        }
+    },
+    @{
+        Name = "Original resolver rejects multiple manual tracks without evidence"
+        Run = {
+            $info = New-OriginalSubtitleInfo -Subtitles ([pscustomobject]@{
+                en = @((New-DirectSubtitleFormat))
+                de = @((New-DirectSubtitleFormat))
+            })
+
+            try {
+                Resolve-TranscriptSubtitleChoice -Info $info | Out-Null
+                throw "Expected ambiguous original subtitles."
             }
             catch {
-                Assert-True ($_.Exception.Message -match "de") "Expected selected language in error: $($_.Exception.Message)"
-                Assert-True ($_.Exception.Message -match "Available") "Expected available list in error: $($_.Exception.Message)"
-                Assert-True ($_.Exception.Message -match "ru") "Expected ru in available list: $($_.Exception.Message)"
+                Assert-True ($_.Exception.Message -match "OriginalSubtitleAmbiguous") "Expected a bounded ambiguity code, got: $($_.Exception.Message)"
+            }
+        }
+    },
+    @{
+        Name = "Original resolver rejects translated automatic captions without an original"
+        Run = {
+            $info = New-OriginalSubtitleInfo -AutomaticCaptions ([pscustomobject]@{
+                en = @((New-DirectSubtitleFormat))
+                ru = @((New-DirectSubtitleFormat))
+            })
+
+            try {
+                Resolve-TranscriptSubtitleChoice -Info $info | Out-Null
+                throw "Expected no verified original subtitles."
+            }
+            catch {
+                Assert-True ($_.Exception.Message -match "NoVerifiedOriginalSubtitle") "Expected untrusted automatic tracks to be rejected, got: $($_.Exception.Message)"
+            }
+        }
+    },
+    @{
+        Name = "Original resolver distinguishes missing eligible subtitle tracks"
+        Run = {
+            $info = New-OriginalSubtitleInfo `
+                -Subtitles ([pscustomobject]@{
+                    en = @((New-DirectSubtitleFormat -Extension "json3"))
+                }) `
+                -Formats @([pscustomobject]@{
+                    acodec = "opus"
+                    language = "en"
+                    language_preference = 10
+                })
+
+            try {
+                Resolve-TranscriptSubtitleChoice -Info $info | Out-Null
+                throw "Expected no eligible subtitle tracks."
+            }
+            catch {
+                Assert-True ($_.Exception.Message -match "NoSubtitleTracks") "Expected the no-tracks condition, got: $($_.Exception.Message)"
+            }
+        }
+    },
+    @{
+        Name = "Original resolver stops on same-base manual ambiguity"
+        Run = {
+            $info = New-OriginalSubtitleInfo `
+                -Subtitles ([pscustomobject]@{
+                    "en-US" = @((New-DirectSubtitleFormat))
+                    "en-GB" = @((New-DirectSubtitleFormat))
+                }) `
+                -Formats @([pscustomobject]@{
+                    acodec = "opus"
+                    language = "en"
+                    language_preference = 10
+                })
+
+            try {
+                Resolve-TranscriptSubtitleChoice -Info $info | Out-Null
+                throw "Expected same-base ambiguity."
+            }
+            catch {
+                Assert-True ($_.Exception.Message -match "OriginalSubtitleAmbiguous") "Expected same-base ambiguity instead of a regional guess, got: $($_.Exception.Message)"
+            }
+        }
+    },
+    @{
+        Name = "Original resolver ignores unusable formats and service tracks"
+        Run = {
+            $info = New-OriginalSubtitleInfo -Subtitles ([pscustomobject]@{
+                live_chat = @((New-DirectSubtitleFormat))
+                fr = @(
+                    (New-DirectSubtitleFormat -Extension "json3"),
+                    (New-DirectSubtitleFormat -Url "file:///C:/captions.vtt")
+                )
+                es = @(
+                    (New-DirectSubtitleFormat -Extension "srt"),
+                    (New-DirectSubtitleFormat -Extension "vtt")
+                )
+            })
+
+            $choice = Resolve-TranscriptSubtitleChoice -Info $info
+
+            Assert-True ($choice.RawTrackTag -eq "es") "Expected the only eligible non-service track, got '$($choice.RawTrackTag)'."
+            Assert-True ($choice.PreferredExtension -eq "vtt") "Expected direct VTT to win over direct SRT."
+        }
+    },
+    @{
+        Name = "Original resolver uses original audio preference and ignores descriptive audio"
+        Run = {
+            $info = New-OriginalSubtitleInfo `
+                -Subtitles ([pscustomobject]@{
+                    en = @((New-DirectSubtitleFormat))
+                    de = @((New-DirectSubtitleFormat))
+                }) `
+                -Formats @(
+                    [pscustomobject]@{ acodec = "opus"; language = "de"; language_preference = -10 },
+                    [pscustomobject]@{ acodec = "mp4a"; language = "en"; language_preference = 10 },
+                    [pscustomobject]@{ acodec = "opus"; language = "en"; language_preference = 10 },
+                    [pscustomobject]@{ acodec = "none"; language = "de"; language_preference = 10 }
+                )
+
+            $choice = Resolve-TranscriptSubtitleChoice -Info $info
+
+            Assert-True ($choice.RawTrackTag -eq "en") "Expected repeated original-audio evidence to deduplicate to English."
+        }
+    },
+    @{
+        Name = "Original resolver rejects conflicting strongest evidence"
+        Run = {
+            $info = New-OriginalSubtitleInfo `
+                -Subtitles ([pscustomobject]@{
+                    en = @((New-DirectSubtitleFormat))
+                    de = @((New-DirectSubtitleFormat))
+                }) `
+                -AutomaticCaptions ([pscustomobject]@{
+                    "en-orig" = @((New-DirectSubtitleFormat))
+                }) `
+                -Formats @([pscustomobject]@{
+                    acodec = "opus"
+                    language = "de"
+                    language_preference = 10
+                })
+
+            try {
+                Resolve-TranscriptSubtitleChoice -Info $info | Out-Null
+                throw "Expected conflicting evidence."
+            }
+            catch {
+                Assert-True ($_.Exception.Message -match "OriginalLanguageAmbiguous") "Expected conflicting original-language evidence to fail, got: $($_.Exception.Message)"
             }
         }
     },
@@ -958,7 +1303,7 @@ catch {
         }
     },
     @{
-        Name = "CLI core returns one public result when attempt callback writes output"
+        Name = "CLI core returns one original-track result"
         Run = {
             $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("transcript-tool-cli-result-tests-" + [System.Guid]::NewGuid().ToString("N"))
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
@@ -968,20 +1313,17 @@ catch {
                 $results = @(Save-TranscriptFromYoutubeCli `
                     -Url "https://example.test/callback-output" `
                     -OutputDir $dir `
-                    -Preference "ru" `
-                    -SubtitleLanguages "ru" `
                     -NoClean $false `
                     -KeepSubtitles $false `
                     -Srt $false `
                     -CleanTranscript $false `
-                    -YtDlpPath $fakeYtDlpPath `
-                    -OnAttempt { param($language) "callback-output-$language" })
+                    -YtDlpPath $fakeYtDlpPath)
 
                 Assert-True ($results.Count -eq 1) "Expected one result object, got $($results.Count): $($results -join ", ")"
                 Assert-True ($results[0] -is [pscustomobject]) "Expected a PSCustomObject result."
                 Assert-PropertyNames `
                     -Value $results[0] `
-                    -Expected @("TextPath", "ReviewPath", "SubtitlePaths", "OutputDir", "FoundSubtitles", "ExitCode", "YtDlpExitCode", "Output", "StdErr") `
+                    -Expected @("TextPath", "ReviewPath", "SubtitlePaths", "OutputDir", "FoundSubtitles", "ExitCode", "YtDlpExitCode", "Output", "StdErr", "RawTrackTag", "CanonicalLanguageTag", "BaseLanguage", "SourceKind", "Confidence", "WarningCode") `
                     -Message "Unexpected CLI-core result shape."
                 Assert-True ($results[0].FoundSubtitles) "Expected downloaded subtitles."
             }
@@ -1004,8 +1346,6 @@ catch {
                 $result = Save-TranscriptFromYoutubeCli `
                     -Url "https://example.test/cli-failure" `
                     -OutputDir $dir `
-                    -Preference "ru" `
-                    -SubtitleLanguages "ru" `
                     -NoClean $false `
                     -KeepSubtitles $false `
                     -Srt $false `
@@ -1034,7 +1374,7 @@ catch {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
             try {
-                $baseName = New-TranscriptFileName -Title "Test" -VideoId "abc123" -Language "ru"
+                $baseName = New-TranscriptFileName -Title "Test" -VideoId "abc123" -Language "en-US"
                 $baseStem = [System.IO.Path]::GetFileNameWithoutExtension($baseName)
                 $oldText = Join-Path $dir "$baseStem.txt"
                 $oldSecondSubtitle = Join-Path $dir "$baseStem-2.vtt"
@@ -1046,13 +1386,12 @@ catch {
                 $saved = Save-TranscriptFromYoutube `
                     -Url "https://youtube.com/watch?v=working" `
                     -OutputDir $dir `
-                    -Language "ru" `
                     -KeepSubtitles $true `
                     -YtDlpPath $fakeYtDlpPath
 
                 Assert-PropertyNames `
                     -Value $saved `
-                    -Expected @("TextPath", "SubtitlePath", "OutputDir", "Language", "SubtitleTag", "Source", "Title", "VideoId", "AvailableLanguages") `
+                    -Expected @("TextPath", "SubtitlePath", "OutputDir", "RawTrackTag", "CanonicalLanguageTag", "BaseLanguage", "SourceKind", "Confidence", "WarningCode", "Title", "VideoId") `
                     -Message "Unexpected GUI-core result shape."
                 Assert-True ($saved.TextPath -eq (Join-Path $dir "$baseStem-3.txt")) "Expected -3 GUI transcript, got $($saved.TextPath)"
                 Assert-True ($saved.SubtitlePath -eq (Join-Path $dir "$baseStem-3.vtt")) "Expected coordinated -3 GUI subtitle, got $($saved.SubtitlePath)"
@@ -1176,7 +1515,6 @@ catch {
                     Save-TranscriptFromYoutube `
                         -Url "https://youtube.com/watch?v=download-long" `
                         -OutputDir $dir `
-                        -Language "ru" `
                         -KeepSubtitles $false `
                         -YtDlpPath $fakeYtDlpPath | Out-Null
                     throw "Expected bounded download error."

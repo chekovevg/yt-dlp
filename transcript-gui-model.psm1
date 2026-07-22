@@ -195,11 +195,7 @@ function New-TranscriptBatchPlan {
         [object[]]$Rows,
 
         [Parameter(Mandatory = $true)]
-        [string]$RootDir,
-
-        [Parameter(Mandatory = $true)]
-        [ValidateSet("auto", "ru", "en", "de")]
-        [string]$Language
+        [string]$RootDir
     )
 
     if (@($Rows).Count -gt 6) {
@@ -224,7 +220,6 @@ function New-TranscriptBatchPlan {
             Url = $url
             ProjectName = $projectName
             OutputDir = $outputDir
-            Language = $Language
         }
     }
 

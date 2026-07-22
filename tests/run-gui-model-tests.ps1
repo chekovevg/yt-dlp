@@ -251,8 +251,7 @@ $tests = @(
                 $plan = @(
                     New-TranscriptBatchPlan `
                         -Rows $rows `
-                        -RootDir $testRoot `
-                        -Language "ru"
+                        -RootDir $testRoot
                 )
 
                 Assert-Equal $plan.Count 2 "Blank rows were not ignored."
@@ -261,7 +260,7 @@ $tests = @(
                 Assert-Equal $plan[0].OutputDir ([System.IO.Path]::GetFullPath($projectDir)) "Project output changed."
                 Assert-Equal $plan[1].CardId "two" "Batch order changed."
                 Assert-Equal $plan[1].OutputDir ([System.IO.Path]::GetFullPath($testRoot)) "Root output changed."
-                Assert-Equal $plan[1].Language "ru" "Shared language changed."
+                Assert-True (-not $plan[1].PSObject.Properties["Language"]) "Batch items still carry a user-selected language."
             }
             finally {
                 if (Test-Path -LiteralPath $testRoot) {
@@ -284,8 +283,7 @@ $tests = @(
                     -Action {
                         New-TranscriptBatchPlan `
                             -Rows @([pscustomobject]@{ CardId = "one"; Url = ""; ProjectName = "" }) `
-                            -RootDir $testRoot `
-                            -Language "auto"
+                            -RootDir $testRoot
                     } `
                     -ExpectedMessage "NoVideos" `
                     -Message "An empty batch was accepted."
@@ -297,8 +295,7 @@ $tests = @(
                     -Action {
                         New-TranscriptBatchPlan `
                             -Rows $tooMany `
-                            -RootDir $testRoot `
-                            -Language "auto"
+                            -RootDir $testRoot
                     } `
                     -ExpectedMessage "TooManyRows" `
                     -Message "More than six cards were accepted."
@@ -313,8 +310,7 @@ $tests = @(
                                     ProjectName = "Missing"
                                 }
                             ) `
-                            -RootDir $testRoot `
-                            -Language "auto"
+                            -RootDir $testRoot
                     } `
                     -ExpectedMessage "ProjectMissing" `
                     -Message "A missing selected project was accepted."

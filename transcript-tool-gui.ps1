@@ -48,14 +48,6 @@ function Get-TranscriptCardById {
         Select-Object -First 1
 }
 
-function Get-SelectedTranscriptLanguage {
-    if ($script:view.LanguageBox.SelectedItem) {
-        return [string]$script:view.LanguageBox.SelectedItem.Value
-    }
-
-    return "auto"
-}
-
 function Get-TranscriptCardProjectName {
     param([Parameter(Mandatory = $true)][object]$Card)
 
@@ -136,7 +128,6 @@ function Set-TranscriptUiBusy {
     $script:isBusy = $Busy
     $script:view.RootBox.Enabled = -not $Busy
     $script:view.BrowseButton.Enabled = -not $Busy
-    $script:view.LanguageBox.Enabled = -not $Busy
 
     foreach ($card in $script:cards) {
         $card.UrlBox.Enabled = -not $Busy
@@ -478,7 +469,10 @@ function Complete-CurrentTranscriptQueueItem {
         Set-TranscriptVideoCardState `
             -Card $card `
             -State "Success" `
-            -Message ($script:uiText.SuccessFileFormat -f ([System.IO.Path]::GetFileName($card.TextPath)))
+            -Message (Get-TranscriptCompletedMessage `
+                -UiText $script:uiText `
+                -TextPath $card.TextPath `
+                -WarningCode ([string]$Result.WarningCode))
         $card.ResultContextMenu.Enabled = -not $script:isBusy
     }
     else {
@@ -541,7 +535,6 @@ function Start-ActiveTranscriptItem {
                 $workerScriptPath,
                 [string]$Item.Url,
                 [string]$Item.OutputDir,
-                [string]$Item.Language,
                 $startGateName,
                 $script:activeWorkerIdentityPath,
                 $script:activeOperationId
@@ -552,7 +545,6 @@ function Start-ActiveTranscriptItem {
                     $workerScriptPath,
                     $url,
                     $outputDir,
-                    $language,
                     $startGateName,
                     $workerIdentityPath,
                     $operationId
@@ -587,7 +579,6 @@ function Start-ActiveTranscriptItem {
                     -ArgumentList @(
                         "-Url", $url,
                         "-OutputDir", $outputDir,
-                        "-Language", $language,
                         "-KeepSubtitles", "0",
                         "-OperationId", $operationId
                     )
@@ -642,18 +633,15 @@ function Start-TranscriptQueue {
 
     try {
         $rootPath = Ensure-TranscriptRootDirectory
-        $language = Get-SelectedTranscriptLanguage
         $plan = @(
             New-TranscriptBatchPlan `
                 -Rows $Rows `
-                -RootDir $rootPath `
-                -Language $language
+                -RootDir $rootPath
         )
         Assert-TranscriptOutputDirectoriesWritable `
             -OutputDirs @($plan | ForEach-Object { $_.OutputDir })
         Write-TranscriptSettings `
             -OutputDir $rootPath `
-            -Language $language `
             -KeepSubtitles:$false
 
         foreach ($item in $plan) {

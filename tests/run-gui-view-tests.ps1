@@ -49,15 +49,19 @@ try {
 
     $mainView = New-TranscriptMainView `
         -UiText $uiText `
-        -Settings ([pscustomobject]@{ OutputDir = $testRoot; Language = "ru" }) `
+        -Settings ([pscustomobject]@{ OutputDir = $testRoot; KeepSubtitles = $false }) `
         -Projects @("Research")
 
+    $expectedSaveText = '"\u0421\u043E\u0445\u0440\u0430\u043D\u0438\u0442\u044C \u0442\u0435\u043A\u0441\u0442"' |
+        ConvertFrom-Json
+    Assert-Equal $uiText.SaveVideos $expectedSaveText "Primary action still describes saving a video."
+    Assert-Equal ($uiText.SaveVideosFormat -f 2) "$expectedSaveText (2)" "Counted primary action copy is incorrect."
+    Assert-Equal $mainView.SaveQueueButton.Text $uiText.SaveVideos "Idle primary action does not use the save-text copy."
     Assert-True ($mainView.Form.MinimumSize.Width -ge 720) "Minimum window width is too small."
     Assert-True ($mainView.Form.MinimumSize.Height -ge 520) "Minimum window height is too small."
     Assert-True $mainView.VideoList.AutoScroll "Video list does not scroll."
     Assert-Equal $mainView.KeepSubtitlesBox $null "The removed VTT option is still exposed."
-    Assert-Equal $mainView.LanguageBox.Items.Count 4 "Language choices changed."
-    Assert-Equal $mainView.LanguageBox.SelectedItem.Value "ru" "Saved language was not selected."
+    Assert-True (-not $mainView.PSObject.Properties["LanguageBox"]) "The removed language selector is still exposed."
     Assert-True ($mainView.Form.AcceptButton -eq $mainView.SaveQueueButton) "Enter does not start the queue."
     Assert-Equal $mainView.AddVideoButton.AccessibleName $uiText.AddVideo "Add-video action lacks a name."
     Assert-Equal $mainView.OpenRootButton $null "The removed open-root button is still exposed."
@@ -127,10 +131,28 @@ try {
     }
     Assert-True (-not $secondCard.RetryButton.Visible) "Retry action is visible before failure."
 
+    $automaticMessage = Get-TranscriptCompletedMessage `
+        -UiText $uiText `
+        -TextPath (Join-Path $testRoot "automatic.txt") `
+        -WarningCode "AutomaticOriginalAccuracy"
+    Assert-True ($automaticMessage -match [regex]::Escape($uiText.WarningAutomaticOriginal)) "ASR warning is missing from the completed-card message."
+    $manualMessage = Get-TranscriptCompletedMessage `
+        -UiText $uiText `
+        -TextPath (Join-Path $testRoot "manual.txt") `
+        -WarningCode "ManualLanguageUnconfirmed"
+    Assert-True ($manualMessage -match [regex]::Escape($uiText.WarningManualUnconfirmed)) "Unconfirmed-language warning is missing from the completed-card message."
+
+    $secondCard.Container.MinimumSize = [System.Drawing.Size]::new(640, 0)
+    $secondCard.Container.MaximumSize = [System.Drawing.Size]::new(640, 0)
+    $secondCard.Container.Width = 640
+    $secondCard.Container.PerformLayout()
+    Assert-True (-not $secondCard.StatusLabel.AutoEllipsis) "Long quality warnings are still configured to truncate."
+    Assert-True ($secondCard.StatusLabel.MaximumSize.Width -gt 0) "Quality warning label has no wrapping width."
+
     Set-TranscriptVideoCardState `
         -Card $secondCard `
         -State "Success" `
-        -Message $uiText.Success
+        -Message $automaticMessage
     Assert-True $secondCard.ResultContextMenu.Enabled "Result context menu is disabled after success."
     foreach ($control in @($secondCard.UrlBox, $secondCard.ProjectBox)) {
         Assert-True `
@@ -138,7 +160,8 @@ try {
             "A focused card control cannot open result actions from the keyboard."
     }
     Assert-True (-not $secondCard.RetryButton.Visible) "Retry action is visible after success."
-    Assert-Equal $secondCard.StatusLabel.Text $uiText.Success "Success message changed."
+    Assert-Equal $secondCard.StatusLabel.Text $automaticMessage "Persistent success warning changed."
+    Assert-Equal $secondCard.StatusLabel.AccessibleName $automaticMessage "Persistent warning is not exposed to assistive technology."
     Assert-Equal `
         $secondCard.Container.AccessibleDescription `
         $uiText.ResultContextHint `
@@ -173,8 +196,9 @@ try {
     Write-Host "PASS Russian resources load explicitly as UTF-8"
     Write-Host "PASS Main view is adaptive and keeps only the primary footer action"
     Write-Host "PASS Video cards expose result actions through a success-only context menu"
+    Write-Host "PASS Completed cards preserve subtitle quality warnings"
     Write-Host "PASS Project selector refresh preserves only existing projects"
-    Write-Host "4/4 GUI view tests passed."
+    Write-Host "5/5 GUI view tests passed."
 }
 finally {
     foreach ($card in @($firstCard, $secondCard)) {
