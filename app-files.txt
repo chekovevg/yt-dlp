@@ -7,9 +7,12 @@ download-subs.ps1
 install.cmd
 install.ps1
 transcript-job-lifecycle.ps1
+transcript-gui-model.psm1
+transcript-gui-view.psm1
 transcript-tool-gui.ps1
 transcript-tool.psm1
 transcript-worker.ps1
+ui-text.ru.json
 uninstall.cmd
 uninstall.ps1
 youtube-transcript-tool.cmd

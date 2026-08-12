@@ -94,6 +94,16 @@ $tests = @(
                         Where-Object { $_ -and -not $_.StartsWith("#") }
                 )
 
+                foreach ($requiredGuiFile in @(
+                        "transcript-gui-model.psm1",
+                        "transcript-gui-view.psm1",
+                        "ui-text.ru.json"
+                    )) {
+                    Assert-True `
+                        ($expectedFiles -contains $requiredGuiFile) `
+                        "Application manifest omitted $requiredGuiFile."
+                }
+
                 foreach ($relativePath in $expectedFiles) {
                     Assert-True `
                         (Test-Path -LiteralPath (Join-Path $installDir $relativePath) -PathType Leaf) `

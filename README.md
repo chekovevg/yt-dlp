@@ -7,12 +7,14 @@ The bundled `yt-dlp.exe` next to the scripts is used first. The desktop app can 
 ## What It Does
 
 - Provides a small desktop window and a script-friendly command-line mode.
-- Accepts a YouTube video link.
-- Saves a `.txt` transcript to a chosen local folder.
+- Queues up to six YouTube video links and processes them sequentially.
+- Saves each `.txt` transcript to the selected root folder or one project subfolder.
+- Creates and reuses one-level project folders from the desktop app.
 - Remains usable while `yt-dlp` is running in the background.
+- Continues later queue items when one video fails and allows the failed item to be retried.
 - Cancels the active background worker and its `yt-dlp` child process when the desktop window is closed.
-- Remembers the save folder, subtitle language, and "also save subtitles" checkbox between launches.
-- Can optionally save the original `.vtt` subtitle file next to the `.txt`.
+- Remembers the root save folder and shared subtitle language between launches.
+- Copies a completed transcript, or the root folder path, to the clipboard.
 
 ## Requirements
 
@@ -105,21 +107,21 @@ YouTube Transcript Tool
 ## How To Use
 
 1. Open the desktop shortcut.
-2. Paste a YouTube link into `YouTube link`.
-3. Choose the save folder.
-4. Choose subtitle language:
-   - `auto`: try `ru`, then `en`, then `de`, then any available language.
-   - `ru`: require Russian subtitles.
-   - `en`: require English subtitles.
-   - `de`: require German subtitles.
-5. Optionally enable `Also save original subtitles when available`.
-6. Click `Save text`.
+2. Choose the root save folder and one shared subtitle language.
+3. Paste a YouTube link into the first video card.
+4. Optionally select a project. `Без проекта` saves directly in the root folder.
+5. Use `Создать проект…` to create a project folder under the selected root.
+6. Use `+ Добавить видео` to add up to six cards. Empty cards are ignored.
+7. Click `Сохранить видео`. Filled cards are processed from top to bottom.
+8. If one video fails, later cards continue. Correct the failed card and click `Повторить`.
+9. Right-click a completed card to open its transcript-file menu.
+10. Choose `Скопировать путь`, `Скопировать содержимое файла`, or `Показать в проводнике`.
 
-When the transcript is saved, the app shows the file path and enables `Open folder`.
+The desktop app saves only readable `.txt` transcripts. The command-line `-KeepSubs` option remains available when the original subtitle file is needed.
 
 ## Output Files
 
-Transcript files are saved in the selected folder.
+Transcript files are saved in the selected root folder. When a project is selected, they are saved in that immediate project subfolder instead.
 
 File names use:
 
@@ -133,7 +135,7 @@ Example:
 2026-05-30_video-title_abc123_de.txt
 ```
 
-If subtitle saving is enabled, a matching `.vtt` file is also saved.
+The desktop app does not create matching `.vtt` files.
 
 ## Settings
 
@@ -143,15 +145,16 @@ Settings are stored here:
 %APPDATA%\YouTubeTranscriptTool\settings.json
 ```
 
-The file stores only:
+The desktop app uses:
 
 - output folder;
-- selected language;
-- whether original subtitles should be saved.
+- selected language.
+
+Older settings files can retain a compatibility `KeepSubtitles` field, but the desktop app ignores it and writes it as `false`.
 
 ## Errors
 
-The app shows user-friendly messages for:
+Each affected video card shows a message for:
 
 - invalid YouTube link;
 - unavailable/private video;
@@ -163,6 +166,7 @@ The app shows user-friendly messages for:
 - file write errors.
 
 If the selected language is unavailable, the error includes the available subtitle language tags.
+An error in one card does not stop the remaining queue.
 
 ## YouTube Subtitle Limitations
 
@@ -182,21 +186,23 @@ Updates are manual; the app does not update in the background and does not provi
 ## Smoke Test Checklist
 
 1. Run `youtube-transcript-tool.cmd`.
-2. Paste a public YouTube video URL.
-3. Choose `auto`.
-4. Choose an output folder you can write to.
-5. Click `Save text`.
-6. Confirm the status reaches `Done`.
-7. Confirm a `.txt` file appears in the selected folder.
-8. Click `Open folder`.
-9. Repeat with `ru`, `en`, or `de` on a video that has that language.
-10. Try a language that is unavailable and confirm the error lists available languages.
+2. Choose an output folder you can write to and create one project.
+3. Add six cards, then remove and re-add one card.
+4. Confirm the inline clear button removes only its URL.
+5. Fill at least two cards, leave one card empty, and assign different projects.
+6. Choose a shared language and click `Сохранить видео`.
+7. Confirm filled cards run top-to-bottom and the empty card is ignored.
+8. Confirm every successful card creates one `.txt` in the expected folder.
+9. Right-click a successful card and confirm all three file actions work: copy path, copy file contents, and show the exact file in Explorer.
+10. Include one failing link and confirm later cards continue and `Повторить` appears.
 
 ## Developer Checks
 
 Run every regression suite from the tool folder:
 
 ```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-gui-model-tests.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-gui-view-tests.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-gui-smoke-tests.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-gui-job-lifecycle-tests.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-transcript-tool-tests.ps1
@@ -204,7 +210,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-download-sub
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\run-install-tests.ps1
 ```
 
-The checks cover desktop launch/responding behavior, non-blocking background-job shutdown, the shared transcript core, the command-line interface, two-process atomic file-collision safety, temporary-directory cleanup, per-user installation, safe uninstall, and package contents.
+The checks cover project and queue planning, adaptive view construction, desktop launch/responding behavior, non-blocking background-job shutdown, the shared transcript core, the command-line interface, two-process atomic file-collision safety, temporary-directory cleanup, per-user installation, safe uninstall, and package contents.
 
 Build the distributable Windows ZIP with:
 
